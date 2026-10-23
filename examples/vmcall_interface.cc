@@ -405,7 +405,7 @@ class EventHandler : public EventCallback {
             cout << '\t' << "RIP: 0x" << hex << regs.rip() << dec << '\n';
 
             // Inject a general protection fault into the guest
-            vcpu.inject_exception(x86::Exception::GP_FAULT, 0);
+            vcpu.x86()->inject_exception(x86::Exception::GP_FAULT, 0);
         }
     }
 

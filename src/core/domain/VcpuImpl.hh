@@ -17,6 +17,7 @@
 
 #include "core/event/HypervisorEvent.hh"
 
+#include <introvirt/core/arch/x86/VcpuOps.hh>
 #include <introvirt/core/domain/Vcpu.hh>
 #include <introvirt/core/fwd.hh>
 
@@ -32,8 +33,16 @@ namespace introvirt {
  * It is subclassed for specific hypervisors, such as the KvmVcpu and the
  * XenVcpu.
  */
-class VcpuImpl : public Vcpu {
+class VcpuImpl : public x86::VcpuOps {
   public:
+    /**
+     * @brief Get the architecture of this processor
+     *
+     * IntroVirt is x86-only today, so every concrete vcpu is x86_64. An arm64
+     * vcpu (Phase 2 of the arm64 port) overrides this.
+     */
+    Architecture architecture() const override { return Architecture::x86_64; }
+
     /**
      * @brief Enable single stepping for this VCPU
      *
@@ -80,6 +89,40 @@ class VcpuImpl : public Vcpu {
      * @brief Decrement system call injection counter
      */
     virtual void syscall_injection_end() = 0;
+
+    // SECTEPE CEILING: backend-neutral syscall-filter modes. KVM maps these 1:1 to
+    // KVM_SYSCALL_FILTER_* (static_assert'd in KvmVcpu.cc); other backends ignore
+    // them. Defined here so windows/injection can pick a mode without including any
+    // kvm header (layering).
+    static constexpr uint32_t SYSCALL_FILTER_NONE = 0;
+    static constexpr uint32_t SYSCALL_FILTER_THREAD_ID = 1;
+    static constexpr uint32_t SYSCALL_FILTER_CR3 = 2;
+    static constexpr uint32_t SYSCALL_FILTER_THREAD_OR_CR3 = 3;
+
+    /**
+     * @brief SECTEPE CEILING: program the per-vcpu syscall-hook emission filter so
+     * the kernel only emits FAST_SYSCALL[_RET] events for the injecting thread /
+     * address space, starving the ~6500-event flood that drives the head-#4 race.
+     *
+     * Default no-op: only the KVM backend implements it, and only when the patched
+     * kernel advertises the ioctl (otherwise it latches unsupported and no-ops).
+     * mode is KVM_SYSCALL_FILTER_* (ship THREAD_OR_CR3 only); deadline_ns is a
+     * monotonic auto-revert backstop so a mis-keyed filter degrades to the flood,
+     * never a hang.
+     */
+    virtual void set_syscall_filter(uint32_t mode, uint64_t thread_id, uint64_t cr3,
+                                    uint64_t deadline_ns) {
+        (void)mode;
+        (void)thread_id;
+        (void)cr3;
+        (void)deadline_ns;
+    }
+
+    /**
+     * @brief SECTEPE CEILING: clear any active syscall-hook emission filter
+     * (revert to emit-all). Default no-op; KVM backend overrides.
+     */
+    virtual void clear_syscall_filter() {}
 
     SystemCallFilter& system_call_filter() override;
     const SystemCallFilter& system_call_filter() const override;

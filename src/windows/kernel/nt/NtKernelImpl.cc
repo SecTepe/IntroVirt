@@ -15,6 +15,9 @@
  */
 #include "NtKernelImpl.hh"
 
+#include "core/domain/DomainImpl.hh"
+#include "core/injection/VcpuPauseGuard.hh"
+#include "windows/WindowsGuestImpl.hh"
 #include "windows/kernel/nt/types/HANDLE_TABLE_IMPL.hh"
 #include "windows/kernel/nt/types/LDR_DATA_TABLE_ENTRY_IMPL.hh"
 
@@ -45,6 +48,9 @@
 #include <mspdb/PDB.hh>
 #include <mspdb/pdb_exception.hh>
 
+#include <optional>
+#include <vector>
+
 #include <boost/algorithm/string.hpp>
 #include <log4cxx/logger.h>
 
@@ -69,6 +75,11 @@ guest_ptr<void> NtKernelImpl<PtrType>::symbol(const std::string& name) const {
     if (!symbol)
         throw SymbolNotFoundException(name);
     return ptr_ + symbol->image_offset();
+}
+
+template <typename PtrType>
+uint64_t NtKernelImpl<PtrType>::page_directory() const {
+    return kernel_cr3_;
 }
 
 template <typename PtrType>
@@ -357,87 +368,138 @@ std::string NtKernelImpl<PtrType>::profile_path() const {
 template <typename PtrType>
 NtKernelImpl<PtrType>::NtKernelImpl(WindowsGuest& guest) : guest_(guest) {
     Domain& domain = guest.domain();
-    Vcpu* vcpu = &domain.vcpu(0);
-
-    // Try to find a VCPU that's in an event
-    for (uint32_t i = 0; i < domain.vcpu_count(); ++i) {
-        Vcpu& v = domain.vcpu(i);
-        if (v.handling_event()) {
-            vcpu = &v;
-            LOG4CXX_DEBUG(logger, "Using event VCPU " << vcpu->id());
-            break;
-        }
-    }
 
     /*
-     * Find the kernel base address.
-     *
-     * The two MSRs should point to code in the kernel, so they're a good starting point.
-     * MSR_LSTAR is for 64-bit and MSR_IA32_SYSENTER_EIP is for 32-bit.
+     * SECTEPE (KPTI detect fix, measured 2026-06-16): the kernel-base MZ search
+     * reads the kernel image through a vcpu's CR3. Under KPTI a vcpu caught at the
+     * syscall entry trampoline has a kernel RIP but the *user* CR3 still loaded
+     * (KiSystemCall64 swaps to the kernel CR3 a few instructions in), so the kernel
+     * image is NOT mapped and the search finds no MZ -> GuestDetectionException ->
+     * "Failed to detect guest operating system" for a boot-variable window.
+     * Instrumentation showed vcpu0 repeatedly parked at LSTAR with the user-PCID
+     * CR3 while another vcpu held a kernel-PCID CR3. So try EACH vcpu's CR3 (an
+     * event vcpu first) until one maps the kernel, instead of relying on vcpu(0).
      */
-    const auto& registers = vcpu->registers();
-    guest_ptr<uint16_t> search_ptr(*vcpu, std::max(registers.msr(x86::Msr::MSR_LSTAR),
-                                                   registers.msr(x86::Msr::MSR_IA32_SYSENTER_EIP)) &
-                                              PageDirectory::PAGE_MASK);
+    std::vector<Vcpu*> candidates;
+    for (uint32_t i = 0; i < domain.vcpu_count(); ++i) // event vcpus first (index order)
+        if (domain.vcpu(i).handling_event())
+            candidates.push_back(&domain.vcpu(i));
+    for (uint32_t i = 0; i < domain.vcpu_count(); ++i)
+        if (!domain.vcpu(i).handling_event())
+            candidates.push_back(&domain.vcpu(i));
+    if (candidates.empty())
+        throw GuestDetectionException(domain, "Guest has no vcpus to detect on");
 
-    LOG4CXX_DEBUG(logger, "Starting NT kernel search at address " << search_ptr);
-
-    /*
-     * TODO: Sometimes this fails. I think the processor is in usermode at the time, and
-     *       spectre/meltdown protection is on, so the page tables don't map the kernel.
-     */
-    // Go down one page at a time and look for the MZ header
+    // Scan backward from a page-aligned kernel-code address `kbase` through an
+    // explicit `cr3` looking for the ntoskrnl MZ/PE header; on success emplace pe_,
+    // set kernel_base_addr, and return true. Shared by the CR3-WRITE hint path and
+    // the live-vcpu fallback so both scan identically. Translation masks the CR3's
+    // PCID bits internally, so `cr3` is passed raw (as registers().cr3() was).
     static const uint64_t MaxRange = 0x1000000;
-    const uint64_t search_bottom = search_ptr.address() - MaxRange;
-    while (search_ptr.address() > search_bottom) {
-        try {
-            if (unlikely(*search_ptr == 0x5a4D)) { // "MZ"
-                LOG4CXX_DEBUG(logger, "Found MZ at " << search_ptr);
-                try {
-                    /*
-                     * Parse the PE of the image and make sure it's one we're expecting
-                     */
-                    static const std::set<std::string> ValidKernelNames{
-                        "ntkrnlmp.pdb", "ntkrnlpa.pdb", "ntoskrnl.pdb", "ntkrpamp.pdb"};
-                    pe_.emplace(search_ptr);
-
-                    const auto* debug_directory = pe_->optional_header().debug_directory();
-
-                    if (!debug_directory ||
-                        debug_directory->Type() != pe::ImageDebugType::IMAGE_DEBUG_TYPE_CODEVIEW) {
-                        LOG4CXX_DEBUG(logger, "Missing IMAGE_DEBUG_DIRECTORY, continuing scan...");
-                        search_ptr -= PageDirectory::PAGE_SIZE / sizeof(uint16_t);
-                        continue;
+    uint64_t kernel_base_addr = 0;
+    auto try_scan = [&](uint64_t cr3, uint64_t kbase) -> bool {
+        if (!kbase)
+            return false;
+        guest_ptr<uint16_t> search_ptr(domain, kbase, cr3);
+        const uint64_t search_bottom = search_ptr.address() - MaxRange;
+        while (search_ptr.address() > search_bottom) {
+            try {
+                if (unlikely(*search_ptr == 0x5a4D)) { // "MZ"
+                    try {
+                        static const std::set<std::string> ValidKernelNames{
+                            "ntkrnlmp.pdb", "ntkrnlpa.pdb", "ntoskrnl.pdb", "ntkrpamp.pdb"};
+                        pe_.emplace(search_ptr);
+                        const auto* debug_directory = pe_->optional_header().debug_directory();
+                        if (!debug_directory || debug_directory->Type() !=
+                                                    pe::ImageDebugType::IMAGE_DEBUG_TYPE_CODEVIEW) {
+                            search_ptr -= PageDirectory::PAGE_SIZE / sizeof(uint16_t);
+                            continue;
+                        }
+                        const std::string pdb_filename =
+                            debug_directory->codeview_data()->PdbFileName();
+                        if (ValidKernelNames.count(pdb_filename) == 0) {
+                            search_ptr -= PageDirectory::PAGE_SIZE / sizeof(uint16_t);
+                            continue;
+                        }
+                        LOG4CXX_DEBUG(logger, "Found NT kernel (" << pdb_filename << ") at "
+                                                                  << search_ptr);
+                        kernel_base_addr = search_ptr.address();
+                        return true;
+                    } catch (pe::PeException& ex) {
+                        LOG4CXX_DEBUG(logger, "Failed to parse PE at " + to_string(search_ptr));
+                    } catch (VirtualAddressNotPresentException& ex) {
+                        LOG4CXX_DEBUG(logger, ex.what());
                     }
-
-                    const auto* cv_data = debug_directory->codeview_data();
-
-                    const std::string pdb_filename = cv_data->PdbFileName();
-                    if (ValidKernelNames.count(pdb_filename) == 0) {
-                        LOG4CXX_DEBUG(logger, "Incorrect PDB file name: " << pdb_filename);
-                        search_ptr -= PageDirectory::PAGE_SIZE / sizeof(uint16_t);
-                        continue; // Try again
-                    }
-
-                    LOG4CXX_DEBUG(logger, "Found PDB Filename: " << pdb_filename);
-                    break;
-                } catch (pe::PeException& ex) {
-                    LOG4CXX_DEBUG(logger, "Failed to parse PE at " + to_string(search_ptr));
-                } catch (VirtualAddressNotPresentException& ex) {
-                    LOG4CXX_DEBUG(logger, ex.what());
                 }
+                search_ptr -= PageDirectory::PAGE_SIZE / sizeof(uint16_t);
+            } catch (VirtualAddressNotPresentException& ex) {
+                LOG4CXX_DEBUG(logger, ex.what());
             }
-            search_ptr -= PageDirectory::PAGE_SIZE / sizeof(uint16_t);
-        } catch (VirtualAddressNotPresentException& ex) {
-            LOG4CXX_DEBUG(logger, ex.what());
+        }
+        pe_.reset(); // clear any partial PE so the failure is unambiguous
+        return false;
+    };
+
+    // MSR_LSTAR/SYSENTER (the syscall entry, in the kernel image) are per-CPU
+    // identical; use any vcpu to get the page-aligned scan start.
+    auto kbase_of = [](const Vcpu& v) -> uint64_t {
+        const auto& r = v.registers();
+        return std::max(r.msr(x86::Msr::MSR_LSTAR), r.msr(x86::Msr::MSR_IA32_SYSENTER_EIP)) &
+               PageDirectory::PAGE_MASK;
+    };
+
+    bool detected = false;
+    uint64_t chosen_cr3 = 0;
+    std::optional<introvirt::inject::VcpuPauseGuard> guard;
+
+    /*
+     * PRIMARY (KPTI): detect_guest() captured the kernel CR3 from the guest's own
+     * SWITCH_TO_KERNEL_CR3 on a syscall/interrupt entry (a CR3-WRITE event). Scan
+     * the kernel base through it first. This is robust even when EVERY vcpu is in
+     * user mode for the whole detection window -- the case that defeats sampling a
+     * live vcpu CR3 -- because the guest itself was forced to load this kernel CR3.
+     */
+    const uint64_t hint = static_cast<DomainImpl&>(domain).detect_cr3_hint();
+    if (hint) {
+        Vcpu& ev = *candidates.front(); // event/first vcpu (registers readable)
+        guard.emplace(ev);
+        if (try_scan(hint, kbase_of(ev))) {
+            chosen_cr3 = hint;
+            detected = true;
+            LOG4CXX_DEBUG(logger, "NT kernel detected via CR3-WRITE hint");
+        } else {
+            guard.reset();
         }
     }
 
-    if (!pe_)
+    /*
+     * FALLBACK: try each vcpu's live CR3 (the previous behaviour). Covers Win10 /
+     * non-KPTI and the early window where a vcpu already holds a kernel CR3, plus
+     * the case where no usable CR3-WRITE hint was captured. The guard holds the
+     * winning vcpu paused for the rest of construction.
+     */
+    if (!detected) {
+        for (Vcpu* cand : candidates) {
+            guard.emplace(*cand);
+            const uint64_t cand_cr3 = cand->registers().cr3();
+            if (try_scan(cand_cr3, kbase_of(*cand))) {
+                chosen_cr3 = cand_cr3;
+                detected = true;
+                break;
+            }
+            guard.reset();
+        }
+    }
+
+    if (!detected)
         throw GuestDetectionException(domain, "Failed to find NT kernel base address");
 
-    // TODO: Why did I have to do this?
-    ptr_.reset(vcpu->domain(), search_ptr.address(), vcpu->registers().cr3());
+    // Bind the kernel base through whichever CR3 mapped it (hint or live vcpu CR3).
+    ptr_.reset(domain, kernel_base_addr, chosen_cr3);
+
+    // SECTEPE: seed the stable kernel CR3 from the CR3 that mapped the kernel. The
+    // KPCR stage below refines this to KernelDirectoryTableBase when available.
+    kernel_cr3_ = chosen_cr3;
 
     filesystem::create_directories(profile_path());
 
@@ -485,9 +547,10 @@ NtKernelImpl<PtrType>::NtKernelImpl(WindowsGuest& guest) : guest_(guest) {
         }
     }
 
-    // Parse object types
-    type_table_.emplace(*this);
-
+    // SECTEPE (KPTI detect window): read InvalidPteMask (the PTE swizzle mask) BEFORE
+    // the type-table build so transition-PTE resolution can un-swizzle standby pages
+    // during that build (and the GLOBAL??/KPCR/CidTable reads below). Previously this
+    // ran after type_table_.emplace().
     try {
         // TODO: Move MI_SYSTEM_INFORMATION into it's own class
         const auto* MiState = LoadOffsets<structs::MI_SYSTEM_INFORMATION>(*this);
@@ -505,6 +568,20 @@ NtKernelImpl<PtrType>::NtKernelImpl(WindowsGuest& guest) : guest_(guest) {
     } catch (TypeInformationException& ex) {
         LOG4CXX_DEBUG(logger, ex.what());
     }
+
+    // SECTEPE (KPTI detect window): the pool reads below (type table, object manager,
+    // KPCR, CidTable) can hit standby/transition pages on a busy fresh boot.
+    // detect_guest() has not yet assigned domain.guest(), so register this
+    // under-construction guest and load the MM PTE offsets now; PageDirectory::translate
+    // then resolves transition PTEs via WindowsGuestImpl::handle_page_fault. The RAII
+    // scope tears the registration down on every ctor exit (normal return or throw).
+    auto& wguest = static_cast<WindowsGuestImpl<PtrType>&>(guest);
+    wguest.begin_detection_pte_resolution(*this);
+    // Torn down at the end of this ctor on success, or in the WindowsGuestImpl ctor's
+    // catch on failure (end_detection_pte_resolution() is a no-op if begin never ran).
+
+    // Parse object types
+    type_table_.emplace(*this);
 
     // Find the GLOBAL?? directory for drive letter mappings
     auto RootDirectory = RootDirectoryObject();
@@ -568,6 +645,33 @@ NtKernelImpl<PtrType>::NtKernelImpl(WindowsGuest& guest) : guest_(guest) {
         kpcrs_.emplace_back(*this, vcpu, KernelDirectoryTableBase);
     }
 
+    /*
+     * SECTEPE (KPTI read-path fix): KernelDirectoryTableBase is the KPCR's stable
+     * kernel-mapping CR3 (or, when Meltdown/Spectre mitigations are off, the live
+     * CR3, which already maps the kernel). Adopt it as kernel_cr3_, the CR3 we hand
+     * out via page_directory() for kernel-structure reads -- chiefly the runtime
+     * KPCR_IMPL::reset() event path (see KPCR_IMPL.cc), which is where the live vcpu
+     * CR3 can genuinely be the USER CR3 under KPTI.
+     *
+     * The ptr_ RE-POINT below is defensive: in THIS ctor the two CR3s are equal in
+     * every reachable path, because the kernel-base MZ search above has no CR3
+     * fallback and runs through the same bootstrap CR3 -- so a user-only CR3 would
+     * have already thrown GuestDetectionException before we got here. Reaching this
+     * line therefore implies ptr_ already maps the kernel, so ptr_.page_directory()
+     * == kernel_cr3_ and the reset() is a no-op (downstream reads byte-for-byte
+     * unchanged). Keep it as cheap insurance that future-proofs against a kernel-base
+     * scan that ever gains a user-CR3 fallback.
+     */
+    if (KernelDirectoryTableBase) {
+        kernel_cr3_ = KernelDirectoryTableBase;
+        if (ptr_.page_directory() != kernel_cr3_) {
+            LOG4CXX_DEBUG(logger, "Re-pointing kernel base from CR3 "
+                                      << n2hexstr(ptr_.page_directory()) << " to kernel CR3 "
+                                      << n2hexstr(kernel_cr3_));
+            ptr_.reset(domain, ptr_.address(), kernel_cr3_);
+        }
+    }
+
     // Service tables
     KeServiceDescriptorTable_.emplace(symbol("KeServiceDescriptorTable"));
     LOG4CXX_DEBUG(logger, "Parsed KeServiceDescriptorTable with "
@@ -603,6 +707,11 @@ NtKernelImpl<PtrType>::NtKernelImpl(WindowsGuest& guest) : guest_(guest) {
     LOG4CXX_INFO(logger, "Detected Windows " << MajorVersion() << '.' << MinorVersion() << ' '
                                              << (is64Bit() ? "x64" : "x86") << " Build "
                                              << NtBuildNumber() << " Processors: " << cpu_count());
+
+    // SECTEPE: detection complete -- stop resolving transition PTEs through the
+    // under-construction guest. The WindowsGuestImpl ctor's catch does the same on
+    // the failure path.
+    wguest.end_detection_pte_resolution();
 }
 
 template <typename PtrType>

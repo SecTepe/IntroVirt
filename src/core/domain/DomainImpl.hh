@@ -46,6 +46,7 @@
 namespace introvirt {
 
 class BreakpointManager;
+class GuestImpl;
 struct worker_thread_info;
 
 /**
@@ -88,6 +89,31 @@ class DomainImpl : public Domain {
 
     bool detect_guest() override;
 
+    /**
+     * @brief A kernel-mapping CR3 captured from a CR3-WRITE event during
+     * detect_guest() (the guest's SWITCH_TO_KERNEL_CR3 on a syscall/interrupt
+     * entry under KPTI). NtKernelImpl uses it to bootstrap the kernel-base scan
+     * when every vcpu is in user mode and the live vcpu CR3 does not map the
+     * kernel. 0 if none was captured. Internal (not on the Domain interface).
+     */
+    uint64_t detect_cr3_hint() const { return detect_cr3_hint_; }
+
+    /**
+     * @brief Set/clear the transient page-fault handler used during guest detection.
+     *
+     * detect_guest() does not assign guest_ until the WindowsGuestImpl is fully
+     * constructed, so the under-construction guest registers itself here to let
+     * PageDirectory::translate resolve transition/standby PTEs (e.g. cold Object
+     * Manager pool pages on a busy fresh boot) during construction. nullptr otherwise.
+     */
+    void set_detection_pf_guest(GuestImpl* g) { detection_pf_guest_ = g; }
+
+    /**
+     * @brief The active page-fault handler: the detection guest if one is currently
+     * being constructed, otherwise the established guest (or nullptr).
+     */
+    GuestImpl* page_fault_guest() const;
+
     Guest* guest() override;
     const Guest* guest() const override;
 
@@ -98,6 +124,7 @@ class DomainImpl : public Domain {
     void suspend_event_step(Event& event) override;
 
     const x86::PageDirectory& page_directory() const override;
+    const PageTableWalker& page_table_walker() const override;
 
     /**
      * @brief Intercept memory access for a guest frame number
@@ -204,6 +231,15 @@ class DomainImpl : public Domain {
     BreakpointManager breakpoint_manager_;
 
     x86::PageDirectory page_directory_;
+
+    // SECTEPE: kernel-mapping CR3 captured from a CR3-WRITE event during
+    // detect_guest() (see detect_cr3_hint()). 0 when none captured.
+    uint64_t detect_cr3_hint_ = 0;
+
+    // SECTEPE: transient page-fault handler active only during guest detection
+    // (the under-construction WindowsGuestImpl), so transition/standby PTEs resolve
+    // before guest_ is assigned. nullptr otherwise. See page_fault_guest().
+    GuestImpl* detection_pf_guest_ = nullptr;
 
     // The event fd for interrupting the threads
     const int efd_;

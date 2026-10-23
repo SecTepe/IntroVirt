@@ -85,10 +85,10 @@ class PageFaultInjector final {
 
         LOG4CXX_DEBUG(logger, "Injecting page fault");
         vcpu.registers().rip(executable_page_.address());
-        vcpu.inject_exception(x86::Exception::PAGE_FAULT, 6, address);
+        vcpu.x86()->inject_exception(x86::Exception::PAGE_FAULT, 6, address);
 
         // Wait for the return event
-        auto new_event = event_.impl().suspend([this](const introvirt::Event& event) {
+        auto new_event = event_.impl().suspend_injection([this](const introvirt::Event& event) {
             if (event.type() == EventType::EVENT_EXCEPTION &&
                 event.vcpu().registers().rip() == executable_page_.address()) {
                 return WakeAction::ACCEPT;

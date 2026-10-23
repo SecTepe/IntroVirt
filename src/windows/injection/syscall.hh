@@ -41,6 +41,7 @@
 #include <log4cxx/logger.h>
 
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <optional>
@@ -148,6 +149,38 @@ class SystemCallInjector final {
             // Wait for the return event
             vcpu.syscall_injection_start();
 
+            // SECTEPE CEILING (dormant until the patched .ko advertises ioctl 0xe0):
+            // starve the per-vcpu FAST_SYSCALL_RET flood so the injected syscall's
+            // return is the deterministic next event for this vcpu. Win11-only (the
+            // heavy-create race target); Win10/Linux never program a filter (mode
+            // stays NONE = emit-all = byte-for-byte today). On an unpatched kernel
+            // set_syscall_filter() latches unsupported and no-ops forever. THREAD_OR_CR3
+            // + the deadline auto-revert mean a wrong key degrades to today's flood,
+            // never a hang (see C1/C2 in WIN11_INJECTION_CROSSLAYER_DESIGN.md).
+            //
+            // KEYS ARE PROVISIONAL and MUST be finalized against the kernel predicate:
+            //   * thread_id must equal the value the kernel emits in
+            //     system_call_ret.thread_id -- THREAD.StackBase() is a best-effort
+            //     placeholder, NOT proven byte-identical to the kernel's kstack base.
+            //   * cr3: the kernel must define which CR3 (user vs kernel; note
+            //     KeStackAttachProcess into the child transiently swaps it) it compares
+            //     at the RET emit point. regs.cr3() here is the post-inject_syscall
+            //     (user-side) CR3.
+            // Because mode is THREAD_OR_CR3, either key matching suffices, and the
+            // deadline bounds any mis-key to the flood window.
+            if (win11_or_newer) {
+                // std::chrono::steady_clock is CLOCK_MONOTONIC on Linux, matching the
+                // kernel's ktime_get_ns() used by the deadline auto-revert (coarse 10s
+                // fail-safe; the kernel author validates the exact clock domain).
+                const uint64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now().time_since_epoch())
+                                            .count();
+                constexpr uint64_t kFilterWindowNs = 10ULL * 1000000000ULL; // 10s fail-safe
+                vcpu.set_syscall_filter(VcpuImpl::SYSCALL_FILTER_THREAD_OR_CR3,
+                                        /*thread_id=*/thread.StackBase(),
+                                        /*cr3=*/regs.cr3(), now_ns + kFilterWindowNs);
+            }
+
             // SECTEPE: return-RIP-aware wake matching.
             //
             // On Win11 a >4-argument syscall (e.g. NtCreateUserProcess) whose
@@ -189,28 +222,74 @@ class SystemCallInjector final {
             // (expected_return_rip_ is unset), fall back to the original generic
             // behaviour so a single, non-nested injection still wakes.
             const std::optional<uint64_t> expected_return_rip = expected_return_rip_;
+            // SECTEPE head#4: the injected userland RSP (rsp_, the stack bottom set in
+            // begin_syscall/begin_sysenter) is thread-private and is restored identically
+            // by SYSRET regardless of reschedule or which physical vcpu retires the
+            // instruction -- the one identity that survives the heavy NtCreateUserProcess
+            // reschedule when KPCR.CurrentThread (the filter_event tid key) and the
+            // observed RIP both go stale. Used as a second wake match below.
+            const uint64_t expected_rsp = rsp_;
             // Release our pause so the injected syscall actually RUNS on the guest
             // during the suspend wait (suspend completes the event -> the vcpu
             // executes the call). Re-paused below once its return is in hand.
             pause_guard_.reset();
             return_event =
-                event_.impl().suspend([expected_return_rip](const introvirt::Event& event) {
+                event_.impl().suspend_injection([expected_return_rip,
+                                       expected_rsp](const introvirt::Event& event) {
                     if (event.type() == EventType::EVENT_FAST_SYSCALL_RET) {
+                        // (1) Exact return-RIP match -- UNCHANGED, evaluated FIRST so
+                        //     the nested-NtDeleteFile disambiguation and the entire
+                        //     Win10/Linux/common path stay byte-for-byte. (registers()
+                        //     is valid here: the RET delivery set in_event_=true.)
                         if (!expected_return_rip ||
                             event.vcpu().registers().rip() == *expected_return_rip) {
                             return WakeAction::ACCEPT;
                         }
-                        // A FAST_SYSCALL_RET for this thread but a different
-                        // injection point (e.g. the inner NtDeleteFile return
-                        // arriving while a different waiter is offered the event
-                        // first, or the kernel running other work in the context
-                        // of the suspended thread). Let it PASS so the loop
-                        // offers it to the matching suspended injection. Mirrors
-                        // the hook_return rsp-mismatch TRACE in DomainImpl.
+                        // (2) SECTEPE head#4: reschedule/migration-stable RSP match.
+                        //     After a heavy NtCreateUserProcess the guest reschedules
+                        //     (and on Win11 may migrate vcpus -- only the advisory
+                        //     IdealProcessor hint is set, no hard Affinity pin), so the
+                        //     filter_event thread_id key AND the observed RIP can go
+                        //     stale while the injected user RSP does not. Without this,
+                        //     the return PASSes every waiter, is dropped, self-completes
+                        //     via ~KvmEvent, and STRANDS the suspended finalization
+                        //     injector (NtResumeThread) -> -T timeout. This is the SAME
+                        //     pure-rsp correlator the hook_return path already trusts
+                        //     across an arbitrary reschedule (DomainImpl::filter_event,
+                        //     new_event.registers().rsp() == return_rsp).
+                        //
+                        // SECTEPE A.1-T2 (user-range RIP guard): rsp is a WEAKER
+                        // discriminator than the exact return RIP above -- a foreign
+                        // FAST_SYSCALL_RET (e.g. a peer thread, or a spurious frame
+                        // observed mid-KPTI-trampoline) can alias expected_rsp by chance.
+                        // A genuine SYSRET/SYSEXIT for THIS injection always retires to a
+                        // userland RIP (canonical user half on x64, < 0x0000_8000_0000_0000);
+                        // a kernel-range RIP on this branch is therefore never our real
+                        // return and must not rsp-alias its way to ACCEPT. The exact-RIP
+                        // match (1) above is evaluated FIRST and is untouched, so the
+                        // Win10/Linux/nested-NtDeleteFile common path stays byte-for-byte;
+                        // this guard only narrows the Win11 fallback branch.
+                        static constexpr uint64_t kCanonicalUserMax = 0x0000'8000'0000'0000ULL;
+                        if (event.vcpu().registers().rsp() == expected_rsp &&
+                            event.vcpu().registers().rip() < kCanonicalUserMax) {
+                            LOG4CXX_DEBUG(syscall_injector_logger,
+                                          "Matched return by rsp 0x"
+                                              << std::hex << expected_rsp << " (rip 0x"
+                                              << event.vcpu().registers().rip()
+                                              << " != expected 0x"
+                                              << (expected_return_rip ? *expected_return_rip : 0)
+                                              << ")");
+                            return WakeAction::ACCEPT;
+                        }
+                        // Not this injection's return -- PASS so the loop offers it to
+                        // the matching suspended injection. Mirrors the hook_return
+                        // rsp-mismatch TRACE in DomainImpl.
                         LOG4CXX_TRACE(syscall_injector_logger,
-                                      "Incorrect return rip: 0x"
+                                      "Incorrect return rip 0x"
                                           << std::hex << event.vcpu().registers().rip()
-                                          << " Wanted 0x" << *expected_return_rip);
+                                          << " / rsp 0x" << event.vcpu().registers().rsp()
+                                          << " (wanted rip 0x" << *expected_return_rip
+                                          << " / rsp 0x" << expected_rsp << ")");
                         return WakeAction::PASS;
                     }
                     return WakeAction::PASS;
@@ -221,6 +300,7 @@ class SystemCallInjector final {
             pause_guard_.emplace(event_.vcpu());
             refresh_registers_after_repause();
             event_.impl().injection_performed(true);
+            vcpu.clear_syscall_filter(); // SECTEPE CEILING: revert emit-all (no-op if unarmed)
 
         } catch (...) {
             // Duplicated because c++ doesn't have 'finally'
@@ -229,6 +309,7 @@ class SystemCallInjector final {
             if (!pause_guard_)
                 pause_guard_.emplace(event_.vcpu());
             refresh_registers_after_repause();
+            vcpu.clear_syscall_filter(); // SECTEPE CEILING: revert emit-all (no-op if unarmed)
             vcpu.syscall_injection_end();
             static_cast<DomainImpl&>(event_.domain()).end_injection(event_);
 
@@ -333,16 +414,23 @@ class SystemCallInjector final {
     }
 
   private:
-    void verify_stack_present(uint64_t stack_bottom, uint64_t stack_top) {
+    void verify_stack_present(uint64_t stack_bottom, uint64_t stack_top, uint64_t cr3) {
         const PtrType first_page = stack_bottom & ~(0xFFFULL);
         const PtrType last_page = stack_top & ~(0xFFFULL);
         PtrType i = last_page;
         do {
-            auto& vcpu = event_.vcpu();
-
             try {
-                // Make sure the page is accessible
-                guest_ptr<uint8_t> p(vcpu, i);
+                // Make sure the page is accessible. SECTEPE: use the cr3 captured
+                // while paused (passed in), NOT vcpu.registers().cr3() -- this runs
+                // with our pause RELEASED (so the nested NtDeleteFile can execute on
+                // the guest), so reading the running vcpu's registers would throw
+                // EBUSY ("Cannot access register state while VCPU is running"). That
+                // EBUSY is a CommandFailedException (not the VirtualAddressNotPresent
+                // we catch below), so it propagated out and aborted the whole
+                // injection -> the ~50% clean "miss" (process created-but-not-resumed
+                // / not created). The address space is the injected thread's and does
+                // not change across the injection, so the captured cr3 is correct.
+                guest_ptr<uint8_t> p(event_.domain(), i, cr3);
             } catch (VirtualAddressNotPresentException& ex) {
                 LOG4CXX_DEBUG(syscall_injector_logger,
                               "Stack " << ex.virtual_address()
@@ -364,8 +452,8 @@ class SystemCallInjector final {
                     }
                 }
 
-                auto result =
-                    introvirt::inject::system_call<nt::NtDeleteFile>(guest_ptr<void>(vcpu, i));
+                auto result = introvirt::inject::system_call<nt::NtDeleteFile>(
+                    guest_ptr<void>(event_.domain(), i, cr3));
                 LOG4CXX_DEBUG(syscall_injector_logger,
                               "Paged in stack via NtDeleteFile hack: " << result);
 
@@ -391,15 +479,18 @@ class SystemCallInjector final {
         const unsigned int stack_offset = (arg_count + 2) * sizeof(uint32_t);
 
         // Nested verify_stack_present injections must run on the guest; drop our
-        // pause around them, then re-pause + refresh the register cache.
+        // pause around them, then re-pause + refresh the register cache. SECTEPE:
+        // capture cr3 while still paused (verify_stack_present must not read the
+        // live vcpu registers during the released-pause window -> EBUSY abort).
+        const uint64_t cr3 = regs.cr3();
         pause_guard_.reset();
         switch (event_.type()) {
         case EventType::EVENT_FAST_SYSCALL:
-            verify_stack_present(regs.rdx() - stack_offset - additional_stack, regs.rdx());
+            verify_stack_present(regs.rdx() - stack_offset - additional_stack, regs.rdx(), cr3);
             break;
         case EventType::EVENT_FAST_SYSCALL_RET:
         case EventType::EVENT_EXCEPTION:
-            verify_stack_present(regs.rsp() - stack_offset - additional_stack, regs.rsp());
+            verify_stack_present(regs.rsp() - stack_offset - additional_stack, regs.rsp(), cr3);
             break;
         }
         pause_guard_.emplace(event_.vcpu());
@@ -410,7 +501,7 @@ class SystemCallInjector final {
         // In KVM, since the RIP changes, it won't happen twice.
         // It will not work if the VCPU is already in the kernel, though!
         // For example, if we do this in a CR3 write event the guest will die.
-        vcpu.inject_sysenter();
+        vcpu.x86()->inject_sysenter();
 
         switch (event_.type()) {
         case EventType::EVENT_FAST_SYSCALL:
@@ -463,8 +554,11 @@ class SystemCallInjector final {
         if (arg_count > 4 || additional_stack > 0) {
             // The nested NtDeleteFile injections must RUN on the guest, so drop
             // our pause around them, then re-pause and refresh the register cache.
+            // SECTEPE: capture cr3 while still paused -- verify_stack_present runs
+            // with the pause released and must not read the live vcpu registers.
+            const uint64_t cr3 = regs.cr3();
             pause_guard_.reset();
-            verify_stack_present(stack_bottom - additional_stack, regs.rsp());
+            verify_stack_present(stack_bottom - additional_stack, regs.rsp(), cr3);
             pause_guard_.emplace(event_.vcpu());
             refresh_registers_after_repause();
         }
@@ -473,7 +567,7 @@ class SystemCallInjector final {
         // In KVM, since the RIP changes, it won't happen twice.
         // It will not work if the VCPU is already in the kernel, though!
         // For example, if we do this in a CR3 write event the guest will die.
-        event_.vcpu().inject_syscall();
+        event_.vcpu().x86()->inject_syscall();
 
         // SECTEPE: SYSCALL stashes the userland return address (the instruction
         // after SYSCALL) in RCX, and the KVM layer reloads the registers after

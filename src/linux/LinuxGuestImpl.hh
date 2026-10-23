@@ -38,6 +38,7 @@ class LinuxGuestImpl final : public LinuxGuest, public GuestImpl {
   public:
     // --- Guest ---
     OS os() const override;
+    Architecture architecture() const override;
     bool x64() const override;
     guest_ptr<void> allocate(size_t& region_size, bool executable = false) override;
     void guest_free(const guest_ptr<void>& ptr, size_t region_size) override;

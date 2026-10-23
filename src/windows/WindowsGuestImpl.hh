@@ -34,10 +34,20 @@ class WindowsGuestImpl final : public WindowsGuest, public GuestImpl {
 
     OS os() const override;
 
+    Architecture architecture() const override;
+
     bool x64() const override;
 
     GuestPageFaultResult handle_page_fault(uint64_t virtual_address, uint64_t page_directory,
                                            uint64_t& pte) const override;
+
+    // SECTEPE: enable/disable transition-PTE resolution during guest detection.
+    // begin_ loads the MM PTE offsets from the (under-construction) kernel and
+    // registers this guest with the domain as the active page-fault handler; an RAII
+    // scope in the NtKernelImpl ctor calls end_ on every exit path. See
+    // DomainImpl::page_fault_guest() / handle_page_fault().
+    void begin_detection_pte_resolution(nt::NtKernelImpl<PtrType>& kernel);
+    void end_detection_pte_resolution();
 
     const SystemCallConverter& syscalls() const override;
 
@@ -84,10 +94,19 @@ class WindowsGuestImpl final : public WindowsGuest, public GuestImpl {
 
     bool page_in(Event& event, uint64_t virtual_address) override;
 
+    // SECTEPE: the kernel to consult in the page-fault path -- the under-construction
+    // detection kernel when set (kernel_ is not yet engaged during detection),
+    // otherwise the established kernel_.
+    const nt::NtKernel& active_kernel() const;
+
     const nt::structs::MMPTE_HARDWARE* mmpte_hardware_ = nullptr;
     const nt::structs::MMPTE_PROTOTYPE* mmpte_prototype_ = nullptr;
     const nt::structs::MMPTE_SOFTWARE* mmpte_software_ = nullptr;
     const nt::structs::MMPTE_TRANSITION* mmpte_transition_ = nullptr;
+
+    // SECTEPE: under-construction kernel during detection (used by active_kernel()
+    // when kernel_ is not yet engaged). nullptr outside detection.
+    nt::NtKernelImpl<PtrType>* detection_kernel_ = nullptr;
 
     Domain* const domain_;
 

@@ -98,7 +98,7 @@ class FunctionInjector final {
         const nt::NTSTATUS original_laststatus = teb->LastStatusValue();
 
         // Wait for the return event
-        auto new_event = event_.impl().suspend([this](const introvirt::Event& event) {
+        auto new_event = event_.impl().suspend_injection([this](const introvirt::Event& event) {
             if (event.type() == EventType::EVENT_EXCEPTION &&
                 event.vcpu().registers().rip() == executable_page_.address()) {
                 return WakeAction::ACCEPT;

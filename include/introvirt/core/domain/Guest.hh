@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include <introvirt/core/arch/Architecture.hh>
 #include <introvirt/core/event/Event.hh>
 #include <introvirt/core/memory/guest_ptr.hh>
 
@@ -40,6 +41,18 @@ class Guest {
      * @return The Guest OS type
      */
     virtual OS os() const = 0;
+
+    /**
+     * @brief Get the Guest CPU architecture
+     *
+     * IntroVirt is x86-only today, so this returns Architecture::x86_64. It is
+     * the consumer-side seam for the arm64 port (see docs/introvirt-arm64.md):
+     * the syscall decoder and guest model branch on this rather than assuming
+     * x86 (e.g. AArch64 takes the syscall number from `x8`, not `rax`).
+     *
+     * @return The Guest CPU architecture
+     */
+    virtual Architecture architecture() const = 0;
 
     /**
      * @brief Check if the guest is 64-bit

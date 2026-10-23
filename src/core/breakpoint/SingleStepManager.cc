@@ -90,6 +90,11 @@ void SingleStepManager::remove_ref(SingleStepImpl& step) {
     }
 }
 
+bool SingleStepManager::stepping(Vcpu& vcpu) {
+    std::lock_guard lock(mtx_);
+    return map_.count(&vcpu) != 0;
+}
+
 void SingleStepManager::interrupt() {
     interrupted_ = true;
 

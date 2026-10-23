@@ -15,6 +15,7 @@
  */
 #include "WindowsGuestImpl.hh"
 #include "common/TypeOffsets.hh"
+#include "core/domain/DomainImpl.hh"
 #include "kernel/nt/structs/structs.hh"
 #include "windows/event/WindowsEventImpl.hh"
 #include "windows/event/WindowsSystemCallEventImpl.hh"
@@ -23,12 +24,14 @@
 
 #include <introvirt/core/core.hh>
 #include <introvirt/core/event/ThreadLocalEvent.hh>
+#include <introvirt/core/exception/VirtualAddressNotPresentException.hh>
 #include <introvirt/core/injection/system_call.hh>
 #include <introvirt/util/compiler.hh>
 #include <introvirt/windows/WindowsGuest.hh>
 #include <introvirt/windows/kernel/nt/NtKernel.hh>
 #include <introvirt/windows/kernel/nt/syscall/NtAllocateVirtualMemory.hh>
 #include <introvirt/windows/kernel/nt/syscall/NtClose.hh>
+#include <introvirt/windows/kernel/nt/syscall/NtDeleteFile.hh>
 #include <introvirt/windows/kernel/nt/syscall/NtFreeVirtualMemory.hh>
 #include <introvirt/windows/kernel/nt/syscall/NtLockVirtualMemory.hh>
 #include <introvirt/windows/kernel/nt/syscall/NtOpenProcess.hh>
@@ -74,6 +77,33 @@ void WindowsGuestImpl<PtrType>::enable_category(const std::string& category,
 }
 
 template <typename PtrType>
+const nt::NtKernel& WindowsGuestImpl<PtrType>::active_kernel() const {
+    if (detection_kernel_)
+        return *detection_kernel_;
+    return *kernel_;
+}
+
+template <typename PtrType>
+void WindowsGuestImpl<PtrType>::begin_detection_pte_resolution(nt::NtKernelImpl<PtrType>& kernel) {
+    // Load the MM PTE bitfield offsets now. The WindowsGuestImpl ctor normally loads
+    // them only after kernel_.emplace() returns -- too late for the pool reads done
+    // INSIDE the NtKernelImpl ctor (type table, object manager, KPCR, CidTable), which
+    // on a busy fresh boot can land on standby/transition pages under KPTI.
+    mmpte_hardware_ = LoadOffsets<nt::structs::MMPTE_HARDWARE>(kernel);
+    mmpte_prototype_ = LoadOffsets<nt::structs::MMPTE_PROTOTYPE>(kernel);
+    mmpte_software_ = LoadOffsets<nt::structs::MMPTE_SOFTWARE>(kernel);
+    mmpte_transition_ = LoadOffsets<nt::structs::MMPTE_TRANSITION>(kernel);
+    detection_kernel_ = &kernel;
+    static_cast<DomainImpl*>(domain_)->set_detection_pf_guest(this);
+}
+
+template <typename PtrType>
+void WindowsGuestImpl<PtrType>::end_detection_pte_resolution() {
+    static_cast<DomainImpl*>(domain_)->set_detection_pf_guest(nullptr);
+    detection_kernel_ = nullptr;
+}
+
+template <typename PtrType>
 std::unique_ptr<Event>
 WindowsGuestImpl<PtrType>::filter_event(std::unique_ptr<HypervisorEvent>&& hypervisor_event) {
     // Just deliver these as-is without adding OS stuff.
@@ -113,8 +143,8 @@ GuestPageFaultResult WindowsGuestImpl<PtrType>::handle_prototype_pte(uint64_t pr
         const bool SwizzleBit = !mmpte_prototype_->SwizzleBit.exists() ||
                                 mmpte_prototype_->SwizzleBit.get_bitfield<PteType>(buffer);
 
-        if (kernel().InvalidPteMask() && !SwizzleBit) {
-            pte = pte & ~(kernel().InvalidPteMask());
+        if (active_kernel().InvalidPteMask() && !SwizzleBit) {
+            pte = pte & ~(active_kernel().InvalidPteMask());
         }
     }
 
@@ -215,8 +245,8 @@ GuestPageFaultResult WindowsGuestImpl<PtrType>::handle_page_fault_internal(uint6
         // If the SwizzleBit is NOT set, we have to bit-flip against PteInvalidMask (if set)
         const bool SwizzleBit = !mmpte_prototype_->SwizzleBit.exists() ||
                                 mmpte_prototype_->SwizzleBit.get_bitfield<PteType>(buffer);
-        if (kernel().InvalidPteMask() && !SwizzleBit) {
-            pte = pte & ~(kernel().InvalidPteMask());
+        if (active_kernel().InvalidPteMask() && !SwizzleBit) {
+            pte = pte & ~(active_kernel().InvalidPteMask());
         }
     }
 
@@ -258,9 +288,16 @@ GuestPageFaultResult WindowsGuestImpl<PtrType>::handle_page_fault_internal(uint6
             }
 
             result = handle_prototype_pte<PteType>(ProtoAddress, page_directory, pte);
-        } else {
-            // VaD lookup required
+        } else if (ThreadLocalEvent::active()) {
+            // VaD lookup required. handle_page_fault_mmvad reads the current
+            // event's vcpu/process (ThreadLocalEvent::get() / vcpu.os_data()), so
+            // only attempt it when an event is active. During a bare out-of-event
+            // walk we cannot resolve a VAD prototype here, so fail this page -- the
+            // transition path above already covers standby kernel pages, which is
+            // what an out-of-event kernel walk needs.
             result = handle_page_fault_mmvad<PteType>(virtual_address, page_directory, pte);
+        } else {
+            result = GuestPageFaultResult::FAILURE;
         }
     }
 
@@ -349,9 +386,17 @@ GuestPageFaultResult WindowsGuestImpl<PtrType>::handle_page_fault(uint64_t virtu
                                                                   uint64_t page_directory,
                                                                   uint64_t& pte) const {
 
-    if (unlikely(!ThreadLocalEvent::active()))
-        return GuestPageFaultResult::FAILURE;
-
+    // SECTEPE: do NOT bail merely because no event is active. The transition/standby
+    // PTE resolution in handle_page_fault_internal (and handle_prototype_pte) is pure
+    // PTE bit-math with no event/vcpu dependency, and running it out-of-event is
+    // required for two things: (1) guest DETECTION -- the type table / object manager
+    // / KPCR / CidTable pool reads in the NtKernelImpl ctor under KPTI (this PR); and
+    // (2) ivexec's bare OUT-OF-EVENT session-ID walk (PspCidTable / HANDLE_TABLE /
+    // EPROCESS) on a busy/early-boot Win11 guest -- the cause of the persistent
+    // "Failed to find the session ID of the target process" (rc=20, PR #504). The only
+    // event/vcpu-dependent sub-path (the VAD/mmvad lookup) is gated on
+    // ThreadLocalEvent::active() at its call site below, so IN-EVENT behaviour is
+    // byte-for-byte unchanged and no event/vcpu state is read when there is no event.
     if (unlikely(PageFaultDepth > 50)) {
         LOG4CXX_WARN(logger, "Max depth exceeded for handle_page_fault. Faulting address: 0x"
                                  << std::hex << virtual_address);
@@ -406,6 +451,12 @@ OS WindowsGuestImpl<PtrType>::os() const {
 }
 
 template <typename PtrType>
+Architecture WindowsGuestImpl<PtrType>::architecture() const {
+    // x86-only today (32- and 64-bit Windows); Windows-on-arm64 is out of scope.
+    return Architecture::x86_64;
+}
+
+template <typename PtrType>
 const SystemCallConverter& WindowsGuestImpl<PtrType>::syscalls() const {
     return *syscalls_;
 }
@@ -456,23 +507,64 @@ guest_ptr<void> WindowsGuestImpl<PtrType>::allocate(size_t& RegionSize, bool exe
         return guest_ptr<void>();
     }
 
-    // Try to lock in the memory region
+    // Try to lock in the memory region.
     size_t LockedRegionSize = RegionSize;
-    result = introvirt::inject::system_call<nt::NtLockVirtualMemory>(
-        0xFFFFFFFFFFFFFFFFLL, BaseAddress, LockedRegionSize, nt::MapType::MAP_PROCESS);
+    bool need_pagein = false;
+    try {
+        result = introvirt::inject::system_call<nt::NtLockVirtualMemory>(
+            0xFFFFFFFFFFFFFFFFLL, BaseAddress, LockedRegionSize, nt::MapType::MAP_PROCESS);
+        need_pagein = !result.NT_SUCCESS();
+    } catch (const VirtualAddressNotPresentException& ex) {
+        // SECTEPE: a freshly MEM_COMMIT'd region is demand-zero (not present), and
+        // NtLockVirtualMemory's in/out pointer-arg marshalling touches the region
+        // itself, so its injection throws VirtualAddressNotPresent and (uncaught)
+        // aborted the whole launch -- a dominant ~50% clean "miss" once the
+        // verify_stack_present EBUSY was fixed. Fall through to the page-in loop,
+        // which faults the region in via the guest (NtReadVirtualMemory passes the
+        // addresses by value, so its own injection does not touch the page). We only
+        // need the region present + writable, so a page-in (no lock) is sufficient.
+        LOG4CXX_DEBUG(logger, "NtLockVirtualMemory inject hit not-present region (0x"
+                                  << std::hex << ex.virtual_address() << "); paging it in");
+        need_pagein = true;
+    }
 
-    if (!result.NT_SUCCESS()) {
-        LOG4CXX_WARN(logger, "Failed to lock newly allocated region: " << result);
-        // Page the region in
+    if (need_pagein) {
+        LOG4CXX_DEBUG(logger, "Paging in newly allocated region");
+        // SECTEPE (head #2): the freshly MEM_COMMIT'd region is DEMAND-ZERO -- no
+        // physical frame exists until the guest faults it, and handle_page_fault
+        // cannot resolve a demand-zero PTE (PageFileHigh==0 -> FAILURE). The earlier
+        // NtRead-into-self page-in survived (guest_ptr<void> is non-mapping), but it
+        // did NOT guarantee the region was present on RETURN: the very next consumer
+        // (inject::GuestAllocation re-wraps this base into a TYPED guest_ptr and writes
+        // it) eagerly translate()s and re-faults -> VirtualAddressNotPresent -> the
+        // launch aborts before NtCreateUserProcess. Fix: fault each page in via the
+        // GUEST using the same proven primitive verify_stack_present uses
+        // (NtDeleteFile on a guest_ptr<void> -- address-only, the guest kernel
+        // ProbeForRead's it so its own MM materialises the demand-zero frame; the call
+        // fails functionally, the side effect is the page-in), and RE-PROBE with a
+        // typed guest_ptr until it translates clean -- so allocate() returns only once
+        // every page is resident and the downstream typed wrap cannot re-fault.
+        // NtDeleteFile routes through SystemCallInjector whose hard-affinity pin is
+        // Win11-gated (no create-deadlock); we deliberately avoid PageFaultInjector
+        // (ungated pin + recurses into allocate). cr3 captured once while paused (the
+        // nested NtDeleteFile releases our pause, so a live cr3 read then would EBUSY).
+        const uint64_t cr3 = vcpu.registers().cr3();
         const auto end_addr = BaseAddress + RegionSize;
         for (auto addr = BaseAddress; addr < end_addr; addr += x86::PageDirectory::PAGE_SIZE) {
-            result = introvirt::inject::system_call<nt::NtReadVirtualMemory>(
-                0xFFFFFFFFFFFFFFFFLL, guest_ptr<void>(vcpu, addr), guest_ptr<void>(vcpu, addr), 1,
-                nullptr);
-            if (unlikely(!result.NT_SUCCESS())) {
-                // TODO: Throw an exception
-                LOG4CXX_WARN(logger, "Page-in call to NtReadVirtualMemory failed: " << result);
-                return guest_ptr<void>();
+            bool present = false;
+            for (int attempt = 0; attempt < 8 && !present; ++attempt) {
+                try {
+                    guest_ptr<uint8_t> probe(domain(), addr, cr3); // typed -> eager translate
+                    present = true;
+                } catch (const VirtualAddressNotPresentException&) {
+                    introvirt::inject::system_call<nt::NtDeleteFile>(
+                        guest_ptr<void>(domain(), addr, cr3));
+                }
+            }
+            if (unlikely(!present)) {
+                LOG4CXX_WARN(logger, "Failed to page in 0x" << std::hex << addr
+                                         << " after retries; aborting allocation");
+                return guest_ptr<void>(); // clean miss -> runner reboot-retries
             }
         }
     }
@@ -521,6 +613,9 @@ WindowsGuestImpl<PtrType>::WindowsGuestImpl(Domain& domain) : domain_(&domain) {
         syscalls_.emplace(*this);
 
     } catch (TraceableException& ex) {
+        // SECTEPE: tear down detection-time transition-PTE resolution (no-op if it
+        // never started) so the domain holds no dangling page-fault guest pointer.
+        end_detection_pte_resolution();
         // Only a debug message because this occasionally fails
         // DomainImpl::detect_os() will try a few times, though.
         LOG4CXX_DEBUG(logger, ex);

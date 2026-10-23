@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include <introvirt/core/arch/PageTableWalker.hh>
 #include <introvirt/core/arch/x86/PageDirectory.hh>
 #include <introvirt/core/breakpoint/Breakpoint.hh>
 #include <introvirt/core/breakpoint/SingleStep.hh>
@@ -146,6 +147,14 @@ class Domain {
      * @return The page directory
      */
     virtual const x86::PageDirectory& page_directory() const = 0;
+
+    /**
+     * @brief Architecture-neutral view of page_directory() for arch-neutral
+     *        consumers (see docs/introvirt-arm64.md).
+     *
+     * @return The page-table walker for this domain
+     */
+    virtual const PageTableWalker& page_table_walker() const = 0;
 
     /**
      * @brief Poll for events and deliver them to the callback

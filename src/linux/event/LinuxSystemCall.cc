@@ -10,7 +10,9 @@
 #include "LinuxSystemCall.hh"
 
 #include "core/event/HypervisorEvent.hh"
+#include "linux/android/BinderDecode.hh"
 #include "linux/kernel/LinuxSyscalls.hh"
+#include "linux/kernel/LinuxSyscallsArm64.hh"
 
 #include <introvirt/core/arch/x86/Registers.hh>
 #include <introvirt/core/domain/Vcpu.hh>
@@ -129,17 +131,18 @@ std::string read_guest_cstr(const Vcpu& vcpu, uint64_t address, size_t max = 256
 } // namespace
 
 LinuxSystemCall::LinuxSystemCall(HypervisorEvent& event) {
+    // Read the syscall number/arguments through the architecture-neutral
+    // accessors so the decoder is not tied to x86 register names. On x86_64
+    // these resolve to rax and rdi,rsi,rdx,r10,r8,r9 (behaviour unchanged); on
+    // AArch64 they resolve to x8 and x0-x5. See docs/introvirt-arm64.md.
     const auto& registers = event.vcpu().registers();
-    number_ = static_cast<uint32_t>(registers.rax());
-    name_ = LinuxSyscalls::name(number_);
+    number_ = static_cast<uint32_t>(registers.syscall_number());
+    name_ = (registers.architecture() == Architecture::aarch64)
+                ? LinuxSyscallsArm64::name(number_)
+                : LinuxSyscalls::name(number_);
 
-    // x86_64 syscall arg registers, in order.
-    args_[0] = registers.rdi();
-    args_[1] = registers.rsi();
-    args_[2] = registers.rdx();
-    args_[3] = registers.r10();
-    args_[4] = registers.r8();
-    args_[5] = registers.r9();
+    for (unsigned i = 0; i < 6; ++i)
+        args_[i] = registers.syscall_argument(i);
 
     const int path_index = path_arg_index(name_);
     if (path_index >= 0) {
@@ -164,13 +167,23 @@ LinuxSystemCall::LinuxSystemCall(HypervisorEvent& event) {
             decoded_.emplace_back("domain", std::move(domain));
         if (!type.empty())
             decoded_.emplace_back("type", std::move(type));
+    } else if (name_ == "ioctl" && args_[1] == android::BINDER_WRITE_READ) {
+        // Android Binder IPC: ioctl(fd, BINDER_WRITE_READ, &bwr). Decode the
+        // BC_TRANSACTION/BC_REPLY records so the syscall stream carries
+        // inter-app call edges (target handle + method code + direction).
+        // arg2 (rdx) is the binder_write_read pointer. Best-effort: a malformed
+        // buffer yields no fields and never throws.
+        auto txns = android::decode_binder_write_read(event.vcpu(), args_[2]);
+        for (auto& field : android::binder_decoded_fields(txns))
+            decoded_.emplace_back(std::move(field.first), std::move(field.second));
     }
 }
 
 void LinuxSystemCall::handle_return_event(Event& event) {
-    // The framework carries this handler to the return event (DomainImpl);
-    // on x86_64 the syscall return value is in RAX (often a negative errno).
-    return_value_ = static_cast<int64_t>(event.vcpu().registers().rax());
+    // The framework carries this handler to the return event (DomainImpl); the
+    // syscall return value is in the neutral return-value register (x86_64: RAX;
+    // AArch64: x0), often a negative errno.
+    return_value_ = static_cast<int64_t>(event.vcpu().registers().syscall_return_value());
     has_return_ = true;
 }
 

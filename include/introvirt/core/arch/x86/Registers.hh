@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include <introvirt/core/arch/RegisterContext.hh>
 #include <introvirt/core/arch/x86/Cr0.hh>
 #include <introvirt/core/arch/x86/Cr4.hh>
 #include <introvirt/core/arch/x86/Efer.hh>
@@ -29,8 +30,15 @@ namespace x86 {
 
 /**
  * @brief A class for holding x86 register state
+ *
+ * Derives from the architecture-neutral @ref RegisterContext so that
+ * arch-neutral consumers (e.g. the syscall decoder) can read the instruction/
+ * stack pointer, syscall number/arguments/return value and role-named system
+ * registers without assuming x86. The neutral accessors are implemented inline
+ * below by delegating to the existing x86 accessors, so concrete subclasses
+ * (e.g. KvmRegisters) need no changes.
  */
-class Registers {
+class Registers : public RegisterContext {
   public:
     /**
      * @brief Get the rax register value
@@ -388,6 +396,63 @@ class Registers {
      * @return the idtr limit
      */
     virtual uint32_t idtr_limit() const = 0;
+
+    /*
+     * Architecture-neutral RegisterContext interface, implemented in terms of
+     * the x86 accessors above. These are `final` so the vtable cost is paid
+     * once here rather than in every concrete backend.
+     */
+
+    Architecture architecture() const final { return Architecture::x86_64; }
+
+    uint64_t pc() const final { return rip(); }
+    void pc(uint64_t val) final { rip(val); }
+
+    uint64_t sp() const final { return rsp(); }
+    void sp(uint64_t val) final { rsp(val); }
+
+    uint64_t syscall_number() const final { return rax(); }
+
+    uint64_t syscall_argument(unsigned index) const final {
+        // x86_64 syscall ABI: rdi, rsi, rdx, r10, r8, r9
+        switch (index) {
+        case 0:
+            return rdi();
+        case 1:
+            return rsi();
+        case 2:
+            return rdx();
+        case 3:
+            return r10();
+        case 4:
+            return r8();
+        case 5:
+            return r9();
+        default:
+            return 0;
+        }
+    }
+
+    uint64_t syscall_return_value() const final { return rax(); }
+
+    uint64_t system_register(SystemRegister reg) const final {
+        switch (reg) {
+        case SystemRegister::SyscallEntry:
+            return msr(Msr::MSR_LSTAR);
+        case SystemRegister::CurrentTaskPointer:
+            // x86_64 `current` lives in a per-CPU slot reached via the kernel
+            // GS base. swapgs makes the live base ambiguous (MSR_GS_BASE vs
+            // MSR_KERNEL_GS_BASE depending on which side of the swap we trap
+            // on); the guest model (LinuxKernelImpl::current_task) tries both.
+            // We return the canonical kernel GS base as the primary candidate.
+            return msr(Msr::MSR_KERNEL_GS_BASE);
+        case SystemRegister::KernelPageTableBase:
+        case SystemRegister::UserPageTableBase:
+            // x86 uses a single CR3 for both halves of the address space.
+            return cr3();
+        }
+        return 0;
+    }
 
     /**
      * @brief Destroy the instance

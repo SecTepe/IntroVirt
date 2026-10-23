@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include <introvirt/core/arch/Architecture.hh>
 #include <introvirt/core/arch/x86/Exception.hh>
 #include <introvirt/core/arch/x86/Registers.hh>
 
@@ -24,14 +25,34 @@
 
 namespace introvirt {
 
+namespace x86 {
+class VcpuOps;
+}
+
 /**
  * @brief A class representing a single virtual processor
  *
  * It is subclassed for specific hypervisors, such as the KvmVcpu and the
  * XenVcpu.
+ *
+ * The x86-typed surface (exception injection, segments, descriptor tables, TSS,
+ * SYSCALL/SYSENTER injection) lives on @ref x86::VcpuOps so a future arm64 vcpu
+ * can derive from this base without implementing x86-only methods. Reach the x86
+ * surface via @ref Vcpu::x86() (see docs/introvirt-arm64.md).
  */
 class Vcpu {
   public:
+    /**
+     * @brief Get the architecture of this processor
+     *
+     * IntroVirt is x86-only today, so this returns Architecture::x86_64. It is
+     * the arch-neutral seam for the arm64 port (see docs/introvirt-arm64.md):
+     * code that must branch on architecture asks here instead of assuming x86.
+     *
+     * @return The architecture of this Vcpu
+     */
+    virtual Architecture architecture() const = 0;
+
     /**
      * @brief Get the processor's registers
      *
@@ -134,40 +155,6 @@ class Vcpu {
     virtual bool intercept_cr_writes(int cr) const = 0;
 
     /**
-     * @brief Inject an exception for this vcpu
-     *
-     * @param vector The exception type to inject
-     * @throws CommandFailedException If the hypervisor reports an error
-     */
-    virtual void inject_exception(x86::Exception vector) = 0;
-
-    /**
-     * @copydoc Vcpu::inject_exception(x86::Exception)
-     * @param error_code The error code to deliver
-     */
-    virtual void inject_exception(x86::Exception vector, int64_t error_code) = 0;
-
-    /**
-     * @copydoc Vcpu::inject_exception(x86::Exception, int64_t error_code)
-     * @param cr2 The cr2 value to set (only for x86::Exception::PAGE_FAULT)
-     */
-    virtual void inject_exception(x86::Exception vector, int64_t error_code, uint64_t cr2) = 0;
-
-    /**
-     * @brief Inject a SYSCALL instruction into the VCPU
-     *
-     * You probably don't want to call this yourself.
-     */
-    virtual void inject_syscall() = 0;
-
-    /**
-     * @brief Inject a SYSCALL instruction into the VCPU
-     *
-     * You probably don't want to call this yourself.
-     */
-    virtual void inject_sysenter() = 0;
-
-    /**
      * @brief Create a clone of this VCPU
      *
      * A cloned VCPU will not be able to change guest state.
@@ -224,41 +211,22 @@ class Vcpu {
     virtual const Domain& domain() const = 0;
 
     /**
-     * @brief Get a segement descriptor given the current selector
+     * @brief Access the x86-specific vcpu surface, if this is an x86 vcpu.
      *
-     * Check the GDT or LDT for the correct segment descriptor
+     * Returns a pointer to the @ref x86::VcpuOps interface (exception injection,
+     * segments, descriptor tables, TSS, SYSCALL/SYSENTER injection) for an x86
+     * vcpu, or `nullptr` otherwise. IntroVirt is x86-only today, so the concrete
+     * vcpu always returns non-null; a future arm64 vcpu inherits the `nullptr`
+     * default.
      *
-     * @param selector
-     * @return x86::Segment
+     * @return The x86 vcpu surface, or nullptr if not an x86 vcpu
      */
-    virtual x86::Segment segment(x86::SegmentSelector selector) const = 0;
+    virtual x86::VcpuOps* x86() noexcept { return nullptr; }
 
     /**
-     * @brief Gets the Global Descriptor Table (GDT) for this VCPU
-     *
-     * @return The GDT for this VCPU
+     * @copydoc Vcpu::x86()
      */
-    virtual x86::SegmentDescriptorTable global_descriptor_table() const = 0;
-
-    /**
-     * @brief Gets the active Local Descriptor Table (LDT) for this VCPU
-     *
-     * @return The active LDT for this VCPU
-     */
-    virtual x86::SegmentDescriptorTable local_descriptor_table() const = 0;
-
-    /**
-     * @brief Gets the Interrupt Descriptor Table (IDT) for this VCPU
-     *
-     * @return The Idt for this VCPU
-     */
-    virtual std::unique_ptr<const x86::Idt> interrupt_descriptor_table() const = 0;
-
-    /**
-     * @brief Get the x86 Task State Segment (TSS)
-     * @return The x86 task state segment
-     */
-    virtual const x86::Tss& task_state_segment() const = 0;
+    virtual const x86::VcpuOps* x86() const noexcept { return nullptr; }
 
     /**
      * @brief Set OS-specific data for address translation

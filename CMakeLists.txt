@@ -2,6 +2,15 @@ CMAKE_MINIMUM_REQUIRED(VERSION 3.10)
 
 PROJECT(libintrovirt)
 
+# The code generators below run at configure time with ${PYTHON_EXECUTABLE}.
+# CMake <= 3.22 (Ubuntu 22.04) set it implicitly; with CMake 3.28 (Ubuntu
+# 24.04, the runner host noble) it stays empty, the generators list no files
+# and configuring fails ("ADD_CUSTOM_COMMAND Wrong syntax ... OUTPUT").
+IF( NOT PYTHON_EXECUTABLE )
+    FIND_PACKAGE(Python3 COMPONENTS Interpreter REQUIRED)
+    SET(PYTHON_EXECUTABLE ${Python3_EXECUTABLE})
+ENDIF()
+
 IF( NOT CMAKE_BUILD_TYPE )
      SET(CMAKE_BUILD_TYPE Debug)
 ENDIF()
@@ -14,6 +23,11 @@ add_compile_options("-Wall" "-Wno-switch")
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Enable CTest so the unit tests in tests/ (registered via ADD_UNIT_TEST) can be
+# run with `ctest`. The hypervisor-dependent integration tools are not
+# registered and so are not run.
+ENABLE_TESTING()
 
 SET(CMAKE_INSTALL_PREFIX "/usr")
 SET(ALL_PACKAGES "")

@@ -71,12 +71,16 @@ class KvmVcpu final : public VcpuImpl {
 
     std::unique_ptr<HypervisorEvent> event() override;
 
-    std::unique_ptr<Vcpu> clone() const override;
+    std::unique_ptr<introvirt::Vcpu> clone() const override;
 
     bool handling_event() const override;
 
     void syscall_injection_start() override;
     void syscall_injection_end() override;
+
+    void set_syscall_filter(uint32_t mode, uint64_t thread_id, uint64_t cr3,
+                            uint64_t deadline_ns) override;
+    void clear_syscall_filter() override;
 
     void os_data(void* data) override;
     void* os_data() const override;
@@ -123,6 +127,13 @@ class KvmVcpu final : public VcpuImpl {
     std::array<uint8_t, 9> cr_hook_ = {};
 
     bool syscall_intercept_ = false;
+    // SECTEPE CEILING: tri-state feature latch for KVM_SET_SYSCALL_HOOK_FILTER.
+    // -1 = unknown (probe on first use), 0 = unsupported (old .ko, no-op forever),
+    // 1 = supported. Detected via ENOTTY/EINVAL from the additive 0xe0 ioctl.
+    int8_t syscall_filter_supported_ = -1;
+    // Whether a non-NONE filter is currently programmed (so we only issue the
+    // clear ioctl when something is actually armed).
+    bool syscall_filter_active_ = false;
     bool int3_intercept_ = false;
     bool single_stepping_ = false;
     bool in_event_ = false;
