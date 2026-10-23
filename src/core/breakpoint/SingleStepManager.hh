@@ -39,6 +39,9 @@ class SingleStepManager final {
   public:
     void handle_event(Event& event);
 
+    /** SECTEPE: true while a SingleStep is registered for (or still winding down on) @p vcpu. */
+    bool stepping(Vcpu& vcpu);
+
     void interrupt();
 
     void add_ref(SingleStepImpl& step);

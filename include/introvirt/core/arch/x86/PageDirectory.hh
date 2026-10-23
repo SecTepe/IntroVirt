@@ -17,6 +17,7 @@
 
 #ifdef __x86_64__
 
+#include <introvirt/core/arch/PageTableWalker.hh>
 #include <introvirt/core/fwd.hh>
 #include <introvirt/util/compiler.hh>
 
@@ -28,7 +29,7 @@
 namespace introvirt {
 namespace x86 {
 
-class PageDirectory final {
+class PageDirectory final : public PageTableWalker {
   public:
     /**
      * @brief
@@ -47,6 +48,11 @@ class PageDirectory final {
     static constexpr uint64_t PAGE_MASK = (~(PAGE_SIZE - 1));
 
     /**
+     * @brief This walker's architecture (always x86_64).
+     */
+    Architecture architecture() const final { return Architecture::x86_64; }
+
+    /**
      * @brief Convert a virtual address to a physical address
      *
      * @param virtual_address The virtual address to translate
@@ -54,12 +60,12 @@ class PageDirectory final {
      * @return The translated address
      * @throws VirtualAddressNotPresentException If the virtual address is not present
      */
-    uint64_t translate(uint64_t virtual_address, uint64_t page_directory) const HOT;
+    uint64_t translate(uint64_t virtual_address, uint64_t page_directory) const override HOT;
 
     /**
      * @brief Reset the cached addresses
      */
-    void reconfigure(const Vcpu& vcpu);
+    void reconfigure(const Vcpu& vcpu) override;
 
     /**
      * @brief Create a PageDirectory

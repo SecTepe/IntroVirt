@@ -33,7 +33,7 @@ int main(int argc, char** argv) {
 
     try {
         const Vcpu& vcpu = d->vcpu(0);
-        auto idt = vcpu.interrupt_descriptor_table();
+        auto idt = vcpu.x86()->interrupt_descriptor_table();
         uint count = idt->count();
 
         std::cout << std::hex;

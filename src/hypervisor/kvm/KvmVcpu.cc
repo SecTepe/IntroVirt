@@ -358,7 +358,7 @@ void KvmVcpu::complete_event() {
     }
 }
 
-std::unique_ptr<Vcpu> KvmVcpu::clone() const {
+std::unique_ptr<introvirt::Vcpu> KvmVcpu::clone() const {
     std::lock_guard lock(mtx_);
     return std::make_unique<KvmVcpu>(*this);
 }
@@ -383,6 +383,80 @@ void KvmVcpu::syscall_injection_end() {
         if (syscall_intercept_ != true)
             _send_command(KVM_SET_SYSCALL_HOOK, false, err);
     }
+}
+
+// Keep the backend-neutral VcpuImpl modes in lockstep with the KVM ABI values so
+// set_syscall_filter() can pass the caller's mode straight through to the ioctl.
+static_assert(VcpuImpl::SYSCALL_FILTER_NONE == KVM_SYSCALL_FILTER_NONE, "");
+static_assert(VcpuImpl::SYSCALL_FILTER_THREAD_ID == KVM_SYSCALL_FILTER_THREAD_ID, "");
+static_assert(VcpuImpl::SYSCALL_FILTER_CR3 == KVM_SYSCALL_FILTER_CR3, "");
+static_assert(VcpuImpl::SYSCALL_FILTER_THREAD_OR_CR3 == KVM_SYSCALL_FILTER_THREAD_OR_CR3, "");
+
+void KvmVcpu::set_syscall_filter(uint32_t mode, uint64_t thread_id, uint64_t cr3,
+                                 uint64_t deadline_ns) {
+    std::lock_guard lock(mtx_); // recursive: pause()/resume() re-take it
+
+    // Old/unpatched kernel already rejected the additive ioctl: stay on the global
+    // flood path (handled by DomainImpl::filter_event's existing FAST_SYSCALL_RET
+    // fallback). NONE is a no-op when nothing is armed.
+    if (syscall_filter_supported_ == 0)
+        return;
+    if (mode == KVM_SYSCALL_FILTER_NONE && !syscall_filter_active_)
+        return;
+
+    struct kvm_syscall_hook_filter f = {};
+    f.mode = mode;
+    f.flags = 0;
+    f.thread_id = thread_id;
+    f.cr3 = cr3;
+    f.deadline_ns = deadline_ns;
+
+    // NOT _send_command: ENOTTY/EINVAL from an unpatched kernel is a benign
+    // "feature absent" signal we must swallow + latch, not throw. Capture errno
+    // BEFORE resume() (KVM_VCPU_UNPAUSE) can clobber it.
+    pause();
+    const int r = ioctl(fd_, KVM_SET_SYSCALL_HOOK_FILTER, reinterpret_cast<unsigned long>(&f));
+    const int saved_errno = errno;
+    resume();
+
+    if (r < 0) {
+        if (saved_errno == ENOTTY || saved_errno == EINVAL) {
+            syscall_filter_supported_ = 0;
+            if (unlikely(logger->isDebugEnabled())) {
+                std::stringstream ss;
+                ss << "Domain " << domain().name() << " Vcpu" << id_
+                   << ": syscall hook filter unsupported (errno " << saved_errno
+                   << "); falling back to global hook";
+                LOG4CXX_DEBUG(logger, ss.str());
+            }
+            return;
+        }
+        throw CommandFailedException("Failed to set syscall hook filter", saved_errno);
+    }
+
+    syscall_filter_supported_ = 1;
+    syscall_filter_active_ = (mode != KVM_SYSCALL_FILTER_NONE);
+}
+
+void KvmVcpu::clear_syscall_filter() {
+    std::lock_guard lock(mtx_);
+    if (syscall_filter_supported_ != 1 || !syscall_filter_active_)
+        return;
+
+    struct kvm_syscall_hook_filter f = {};
+    f.mode = KVM_SYSCALL_FILTER_NONE;
+
+    pause();
+    const int r = ioctl(fd_, KVM_SET_SYSCALL_HOOK_FILTER, reinterpret_cast<unsigned long>(&f));
+    const int saved_errno = errno;
+    resume();
+
+    if (r < 0) {
+        // Best-effort: the kernel deadline_ns auto-revert is the hard backstop.
+        LOG4CXX_WARN(logger, "Failed to clear syscall hook filter: " << strerror(saved_errno));
+        return;
+    }
+    syscall_filter_active_ = false;
 }
 
 void KvmVcpu::_send_command(unsigned long request, unsigned long value, const std::string& errstr) {

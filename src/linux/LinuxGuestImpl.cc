@@ -38,6 +38,9 @@ LinuxGuestImpl::LinuxGuestImpl(Domain& domain) : domain_(&domain) {
 
 OS LinuxGuestImpl::os() const { return OS::Linux; }
 
+// x86_64 only for now; the AArch64 guest model is Phase 4 of the arm64 port.
+Architecture LinuxGuestImpl::architecture() const { return Architecture::x86_64; }
+
 // x86_64 only for now; a PtrType template (32-bit) follows later.
 bool LinuxGuestImpl::x64() const { return true; }
 

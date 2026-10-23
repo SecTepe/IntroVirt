@@ -203,7 +203,7 @@ bool BreakpointManager::handle_int3_event(Event& event, bool deliver_events) {
         // Check to see if there's an actual int3 instruction in place
         if (*guest_ptr<uint8_t>(rip) == 0xCC) {
             LOG4CXX_DEBUG(logger, "Injecting unwanted Int3");
-            vcpu.inject_exception(x86::Exception::INT3);
+            vcpu.x86()->inject_exception(x86::Exception::INT3);
             return false;
         } else {
             LOG4CXX_DEBUG(logger, "Hit unknown breakpoint. This is probably bad for the guest.");
@@ -225,7 +225,7 @@ bool BreakpointManager::handle_int3_event(Event& event, bool deliver_events) {
 
     // Reinject the exeception if this is a nested Int3
     if (active_breakpoint->nested_bp())
-        vcpu.inject_exception(x86::Exception::INT3);
+        vcpu.x86()->inject_exception(x86::Exception::INT3);
 
     // Run callbacks
     active_breakpoint->disable();

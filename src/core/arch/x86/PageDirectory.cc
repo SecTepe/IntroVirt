@@ -186,10 +186,13 @@ retry:
         uint64_t pte_val = *pte_mapping;
         pte = PageTableEntry(pte_val);
         if (unlikely(pte.present() == false)) {
-            if (likely(domain_.guest() != nullptr)) {
+            // SECTEPE: use page_fault_guest() (the detection guest if one is being
+            // constructed, else the established guest) so transition/standby PTEs are
+            // resolved even during detect_guest(), before domain.guest() is assigned.
+            GuestImpl* pf_guest = static_cast<DomainImpl&>(domain_).page_fault_guest();
+            if (likely(pf_guest != nullptr)) {
                 // Let the guest handler give it a try
-                switch (domain_.guest()->impl().handle_page_fault(virtual_address, page_directory,
-                                                                  pte_val)) {
+                switch (pf_guest->handle_page_fault(virtual_address, page_directory, pte_val)) {
                 case GuestPageFaultResult::PTE_FIXED:
                     pte = PageTableEntry(pte_val);
                     update_pte = false;

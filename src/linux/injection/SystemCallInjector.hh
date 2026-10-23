@@ -79,7 +79,7 @@ class SystemCallInjector final {
             vcpu.syscall_injection_start();
             // Force a SYSCALL at the current RIP. As in KVM the RIP changes, so
             // it fires exactly once. Must not be done while already in kernel.
-            vcpu.inject_syscall();
+            vcpu.x86()->inject_syscall();
 
             std::unique_ptr<Event> return_event =
                 event_.impl().suspend([](const Event& e) {
@@ -142,7 +142,7 @@ class SystemCallInjector final {
             // Emulate the SYSCALL instruction: this lands the vCPU at the kernel
             // syscall entry (LSTAR) with our rax/args in place. The body runs on
             // the next vCPU resume.
-            vcpu.inject_syscall();
+            vcpu.x86()->inject_syscall();
             event_.impl().injection_performed(true);
             // Keep the kernel-entry register state: do NOT restore the snapshot,
             // or execve's new image gets clobbered on resume.

@@ -273,6 +273,24 @@ class NtKernel {
      */
     virtual std::string profile_path() const = 0;
 
+    /**
+     * @brief A CR3 that maps the kernel half of the address space.
+     *
+     * Captured at detection (the stable kernel-half CR3 derived from the KPCR's
+     * KernelDirectoryTableBase). Use this to read kernel structures: under KPTI
+     * the live vcpu CR3 may be the *user* CR3, which does not map kernel memory,
+     * so reading kernel data through it throws VirtualAddressNotPresentException.
+     *
+     * Declared at end-of-class (after every pre-existing virtual) ON PURPOSE: it
+     * appends a new vtable slot without shifting any existing slot, so a tool
+     * binary built against older headers still dispatches the other NtKernel
+     * methods correctly against a rebuilt libintrovirt. Non-pure (defaults to 0)
+     * so other NtKernel implementors are unaffected.
+     *
+     * @return A CR3 that maps kernel memory, or 0 if not available.
+     */
+    virtual uint64_t page_directory() const { return 0; }
+
     virtual ~NtKernel() = default;
 };
 

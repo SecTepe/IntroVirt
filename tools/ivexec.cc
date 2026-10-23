@@ -215,26 +215,8 @@ class ExecFileTool final : public EventCallback {
         // PsCreateFailExeName). Fall back to the legacy \??\ DosDevices alias if
         // resolution fails (Win10 path / non-drive-letter targets).
         std::string nt_image_path = resolve_nt_device_path(target_);
-        if (nt_image_path.empty()) {
-            // A drive-letter target that failed the \GLOBAL?? walk falls back
-            // to the legacy "\??\X:" alias, which is INVALID in the injected
-            // Win11 victim context (per-process DosDevices map): then
-            // NtCreateUserProcess fails STATUS_OBJECT_PATH_NOT_FOUND at
-            // PsCreateFailExeName, surfacing only as a generic
-            // CommandFailedException. Warn loudly -- the usual culprit is a
-            // secondary/data volume Windows never gave a normal
-            // \GLOBAL??\X: -> \Device\HarddiskVolumeN symlink, e.g. the disk's
-            // MBR partition type is 0x83 (Linux) rather than a Windows FAT/NTFS
-            // type (0x06/0x0b/0x0c/0x0e/0x07); re-type the partition.
-            if (target_.size() >= 2 && target_[1] == ':')
-                std::cerr << "WARNING: could not resolve \\Device\\HarddiskVolumeN for \""
-                          << target_.substr(0, 2)
-                          << "\" via \\GLOBAL??; falling back to \\??\\ (invalid in the "
-                             "injected Win11 context). If the launch fails at "
-                             "PsCreateFailExeName, check the target volume has a Windows "
-                             "partition type, not 0x83/Linux.\n";
+        if (nt_image_path.empty())
             nt_image_path = "\\??\\" + target_;
-        }
         const std::string current_dir =
             directory_.empty() ? std::string("C:\\Windows\\System32\\") : directory_;
         const std::string desktop = "Winsta0\\Default";
@@ -396,14 +378,30 @@ class ExecFileTool final : public EventCallback {
             return false;
         }
 
-        // Resolve the new process from its handle (handle lives in the launcher's table).
-        auto handle_table = wevent.task().pcr().CurrentThread().Process().ObjectTable();
-        auto new_process = handle_table ? handle_table->ProcessObject(hProcess) : nullptr;
+        // SECTEPE: resolve the new process BEST-EFFORT; this must NOT gate the resume.
+        // The launcher's handle-table page can be transiently not-present (transition
+        // PTE) -> ProcessObject throws VirtualAddressNotPresentException (a
+        // MemoryException, sibling of the InvalidStructureException HANDLE_TABLE_IMPL
+        // catches), which previously propagated out of launch() and left the process
+        // CREATED BUT NOT RESUMED (the "Created process [0]" strand). Retry across
+        // transient misses, but proceed regardless.
+        std::shared_ptr<nt::PROCESS> new_process;
+        for (int attempt = 0; attempt < 8 && !new_process; ++attempt) {
+            try {
+                auto handle_table = wevent.task().pcr().CurrentThread().Process().ObjectTable();
+                if (handle_table)
+                    new_process = handle_table->ProcessObject(hProcess);
+            } catch (const MemoryException& ex) {
+                // not-present/transition handle-table page; resolves on the next read.
+            }
+        }
         new_pid_ = new_process ? new_process->UniqueProcessId() : 0;
 
         std::cerr << "Created process [" << new_pid_ << "]\n";
 
-        // Reconfigure the task filter for our new PID
+        // Reconfigure the task filter for our new PID. Keep add_pid UNCONDITIONAL: an
+        // empty pid_filter_ matches ALL tasks, whereas {0} matches nothing -- so this
+        // preserves today's Win10/PID-0 behaviour byte-for-byte.
         domain_.task_filter().clear();
         domain_.task_filter().add_pid(new_pid_);
 
@@ -421,10 +419,23 @@ class ExecFileTool final : public EventCallback {
             }
         }
 
-        // Close the process handle, resume the suspended thread, close the thread handle.
-        inject::system_call<nt::NtClose>(hProcess);
-        inject::system_call<nt::NtResumeThread>(hThread, nullptr);
-        inject::system_call<nt::NtClose>(hThread);
+        // ALWAYS resume by the raw hThread regardless of PID resolution: created ==
+        // resumed. NtClose failures are non-fatal; a failed resume surfaces the
+        // created-but-not-resumed condition so the runner reboot-retries.
+        try {
+            inject::system_call<nt::NtClose>(hProcess);
+        } catch (const TraceableException&) {
+        }
+        try {
+            inject::system_call<nt::NtResumeThread>(hThread, nullptr);
+        } catch (const TraceableException& ex) {
+            std::cerr << "NtResumeThread failed: " << ex.what() << '\n';
+            return false;
+        }
+        try {
+            inject::system_call<nt::NtClose>(hThread);
+        } catch (const TraceableException&) {
+        }
 
         return true;
     }
@@ -844,6 +855,15 @@ int main(int argc, char** argv) {
         uint64_t session_id = 0xFFFFFFFFFFFFFFFF;
         auto& kernel = guest->kernel();
         constexpr int kSessionTries = 40;
+        // SECTEPE: pause the guest for a consistent, churn-free snapshot during the
+        // session-ID walk. Safe here -- this runs BEFORE intercept_system_calls(),
+        // so there is no injection in flight to deadlock (mirrors detect_guest's
+        // pause). try/catch so domain->resume() always runs even if a read escapes.
+        // The load-bearing fix is in WindowsGuestImpl::handle_page_fault (it now
+        // resolves transition/standby kernel PTEs out-of-event); this pause just
+        // stops kernel churn from mutating the handle table mid-walk.
+        domain->pause();
+        try {
         for (int attempt = 0;
              attempt < kSessionTries && session_id == 0xFFFFFFFFFFFFFFFF; ++attempt) {
             try {
@@ -872,6 +892,11 @@ int main(int argc, char** argv) {
             if (session_id == 0xFFFFFFFFFFFFFFFF)
                 std::this_thread::sleep_for(std::chrono::milliseconds(40));
         }
+        } catch (...) {
+            domain->resume();
+            throw;
+        }
+        domain->resume();
 
         if (session_id == 0xFFFFFFFFFFFFFFFF) {
             std::cerr << "Failed to find the session ID of the target process" << std::endl;

@@ -15,12 +15,22 @@
  */
 #include <introvirt/introvirt.hh>
 
+#include <functional>
+#include <mutex>
+#include <utility>
+
 using namespace introvirt;
 using namespace introvirt::windows;
 
 class SystemCallMonitor final : public EventCallback {
   public:
     void process_event(Event& event) override {
+        // SECTEPE: ivsyscallmon --bp arms out-of-VM breakpoints from inside this
+        // attach (IntroVirt allows one introspection session per domain). Runs
+        // before, and outside, the output lock below.
+        if (event_hook_)
+            event_hook_(event);
+
         switch (event.type()) {
         case EventType::EVENT_FAST_SYSCALL: {
             SystemCall* syscall = event.syscall().handler();
@@ -72,6 +82,12 @@ class SystemCallMonitor final : public EventCallback {
 
     SystemCallMonitor(bool flush, bool json, bool unsupported)
         : flush_(flush), json_(json), unsupported_(unsupported) {}
+
+    /** Called with every event before it is handled. Set before poll() starts. */
+    void set_event_hook(std::function<void(Event&)> hook) { event_hook_ = std::move(hook); }
+
+    /** The lock stdout is written under; other writers must take it to keep records whole. */
+    std::mutex& output_mutex() { return mtx_; }
     ~SystemCallMonitor() { std::cout.flush(); }
 
   private:
@@ -99,4 +115,5 @@ class SystemCallMonitor final : public EventCallback {
     const bool flush_;
     const bool json_;
     const bool unsupported_;
+    std::function<void(Event&)> event_hook_;
 };

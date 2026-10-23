@@ -25,6 +25,7 @@
 #include <introvirt/windows/kernel/nt/types/objects/THREAD.hh>
 
 #include <introvirt/core/arch/arch.hh>
+#include <introvirt/core/arch/x86/VcpuOps.hh>
 #include <introvirt/core/domain/Vcpu.hh>
 #include <introvirt/core/exception/GuestDetectionException.hh>
 #include <introvirt/core/exception/TraceableException.hh>
@@ -107,8 +108,19 @@ void KPCR_IMPL<PtrType>::reset() {
     }
 
     PtrType dtb = KernelDirectoryTableBase();
-    if (!dtb)
-        dtb = vcpu_.registers().cr3();
+    if (!dtb) {
+        // SECTEPE (KPTI read-path fix): prefer the kernel's stable kernel-mapping
+        // CR3 captured at detection over the LIVE vcpu CR3. Under KPTI the live CR3
+        // can be the USER CR3 (kernel memory unmapped), so reading the current
+        // THREAD through it throws -- this is the runtime race the fix targets.
+        // page_directory() is non-zero for any successfully-constructed NtKernel
+        // (it is seeded from the detection-time CR3, which on a pre-KPTI guest is
+        // vcpu(0)'s CR3 and maps the kernel half identically), so the inner live-CR3
+        // fallback is defensive only and effectively unreached for a built kernel.
+        dtb = kernel_.page_directory();
+        if (!dtb)
+            dtb = vcpu_.registers().cr3();
+    }
 
     /*
      * Building the current THREAD here can fail when this VCPU is observed mid-context-switch, or is
@@ -223,7 +235,7 @@ KPCR_IMPL<PtrType>::KPCR_IMPL(NtKernelImpl<PtrType>& kernel, Vcpu& vcpu, uint64_
                       dtb, offsets_->size());
     } else {
         // In 32-bit mode, the KPCR is held in a GDT entry at offset 0x30
-        const x86::Segment segment = vcpu.segment(KGDT_R0_PCR);
+        const x86::Segment segment = vcpu.x86()->segment(KGDT_R0_PCR);
         buffer_.reset(domain, segment.base(), dtb, offsets_->size());
     }
 

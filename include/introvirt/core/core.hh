@@ -20,6 +20,7 @@
 #pragma once
 
 #include <introvirt/core/arch/arch.hh>
+#include <introvirt/core/arch/x86/VcpuOps.hh>
 
 #include <introvirt/core/breakpoint/Breakpoint.hh>
 #include <introvirt/core/breakpoint/SingleStep.hh>

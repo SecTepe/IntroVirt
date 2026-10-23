@@ -20,8 +20,12 @@
  * Monitors Windows system calls in the guest. Filters selected syscalls
  * and prints arguments/return values (optionally JSON). Demonstrates
  * system-call filtering, WindowsEvent, and SystemCallMonitor usage.
+ *
+ * SECTEPE: --bp arms out-of-VM breakpoints in one guest process from inside the
+ * same attach (see shared/BreakpointMonitor.hh); without --bp nothing changes.
  */
 
+#include "shared/BreakpointMonitor.hh"
 #include "shared/SystemCallMonitor.hh"
 
 #include <introvirt/introvirt.hh>
@@ -31,8 +35,10 @@
 
 #include <csignal>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 using namespace introvirt;
 using namespace introvirt::windows;
@@ -54,11 +60,15 @@ int main(int argc, char** argv) {
     po::options_description desc("Options");
     std::string domain_name;
     std::string process_name;
+    std::vector<std::string> bp_args;
+    std::string bp_process;
 
     // clang-format off
     desc.add_options()
       ("domain,D", po::value<std::string>(&domain_name)->required(), "The domain name or ID attach to")
       ("procname", po::value<std::string>(&process_name), "A process name to filter for")
+      ("bp", po::value<std::vector<std::string>>(&bp_args), "Breakpoint, repeatable: target=<0xADDR|module!export|ep+0xNN>[,action=trace|dump|step|custom|scan][,access=exec|write|readwrite][,hits=N]. Windows guests; needs --bp-process or --procname")
+      ("bp-process", po::value<std::string>(&bp_process), "Process the breakpoints belong to (default: --procname)")
       ("no-flush", "Don't flush the output buffer after each event")
       ("json", "Output JSON format")
       ("help", "Display program help")
@@ -75,6 +85,27 @@ int main(int argc, char** argv) {
 
     po::variables_map vm;
     parse_program_options(argc, argv, desc, vm);
+
+    // Validate the breakpoint specs before touching the domain: a bad spec must
+    // fail here, not after the guest has been attached and hooked.
+    std::vector<sectepe::BreakpointSpec> breakpoints;
+    if (!bp_args.empty()) {
+        if (bp_process.empty())
+            bp_process = process_name;
+        if (bp_process.empty()) {
+            std::cerr << "ERROR: --bp needs --bp-process (or --procname)\n";
+            return 1;
+        }
+        for (const auto& text : bp_args) {
+            sectepe::BreakpointSpec spec;
+            std::string error;
+            if (!sectepe::parse_breakpoint_spec(text, spec, error)) {
+                std::cerr << "ERROR: --bp '" << text << "': " << error << '\n';
+                return 1;
+            }
+            breakpoints.push_back(std::move(spec));
+        }
+    }
 
     // Get a hypervisor instance
     // This will automatically select the correct type of hypervisor.
@@ -123,6 +154,20 @@ int main(int argc, char** argv) {
 
     // Start the poll
     SystemCallMonitor monitor(!vm.count("no-flush"), vm.count("json"), vm.count("unsupported"));
+
+    // Breakpoints ride on the syscall monitor's events (one attach per domain).
+    std::unique_ptr<sectepe::BreakpointMonitor> breakpoint_monitor;
+    if (!breakpoints.empty()) {
+        breakpoint_monitor = std::make_unique<sectepe::BreakpointMonitor>(
+            std::move(breakpoints), bp_process, monitor.output_mutex(), !vm.count("no-flush"));
+        if (domain->guest()->os() == OS::Windows) {
+            monitor.set_event_hook(
+                [bp = breakpoint_monitor.get()](Event& event) { bp->on_event(event); });
+        } else {
+            breakpoint_monitor->unsupported("breakpoints are only implemented for Windows guests");
+        }
+    }
+
     domain->poll(monitor);
 
     return 0;

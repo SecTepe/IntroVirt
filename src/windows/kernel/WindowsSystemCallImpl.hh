@@ -39,8 +39,17 @@ class WindowsSystemCallImpl : public SystemCallImpl<_BaseClass> {
     bool supported() const final { return supported_; }
 
     void handle_return_event(Event& event) override {
-        // Update our local pointer
-        event_ = static_cast<WindowsEvent*>(&event);
+        // SECTEPE head#4 (candidate-C): the injector's register-only NoOsEvent fallback
+        // (DomainImpl::filter_event FAST_SYSCALL_RET Phase 1) may hand us a return event
+        // that is NOT a WindowsEvent. Rebinding event_ to it via static_cast would be UB
+        // (NoOsEvent::task()/syscall()/thread_id() throw). Only rebind when the return
+        // event really IS a WindowsEvent; on a NoOsEvent keep the ORIGINAL WindowsEvent so
+        // guest()/kernel()/CurrentThread() stay valid. The result (NTSTATUS/rax) is read
+        // from vcpu().registers(), which is the SAME per-vcpu register cache for the
+        // original and the return event and is refreshed synchronously (syscall.hh
+        // re-pause + refresh_registers_after_repause()) before this call.
+        if (auto* we = dynamic_cast<WindowsEvent*>(&event))
+            event_ = we;
         has_return_event_ = true;
     }
 

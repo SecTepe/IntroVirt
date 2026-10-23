@@ -182,8 +182,37 @@ DomainImpl::filter_event(std::unique_ptr<HypervisorEvent>&& hypervisor_event) {
     {
         std::unique_lock lock(suspended_events_.mtx_);
         if (guest_) {
-            const uint64_t thread_id = guest_->impl().get_current_thread_id(vcpu);
-            auto callbacks = suspended_events_.map_.equal_range(thread_id);
+            // SECTEPE head#4 (the REAL strand fix, part 1): get_current_thread_id reads
+            // KPCR.current_thread_address. Post-reschedule of a heavy injected syscall
+            // (NtCreateUserProcess / NtResumeThread) the injecting vcpu's KPCR page can be
+            // momentarily NON-PRESENT (KPTI user CR3) or yield a bad type index, throwing
+            // MemoryException / IncorrectTypeException. For a genuine FAST_SYSCALL_RET this
+            // must NOT escape filter_event: the RET is a unique_ptr moved into this scope
+            // and would self-complete via ~KvmEvent on unwind, stranding the suspended
+            // injector (created-but-not-resumed). Swallow ONLY for FAST_SYSCALL_RET (both
+            // bad-read families, mirroring the poller-skip catch set) and fall through to
+            // the FAST_SYSCALL_RET fallback below, which offers the RET to injector waiters
+            // by RIP/RSP. Any other event type rethrows (the poller-skip already catches
+            // both families, so no behavior change).
+            uint64_t thread_id = 0;
+            bool tid_ok = true;
+            try {
+                thread_id = guest_->impl().get_current_thread_id(vcpu);
+            } catch (const MemoryException&) {
+                if (hypervisor_event->type() != EventType::EVENT_FAST_SYSCALL_RET)
+                    throw;
+                tid_ok = false;
+            } catch (const windows::IncorrectTypeException&) {
+                if (hypervisor_event->type() != EventType::EVENT_FAST_SYSCALL_RET)
+                    throw;
+                tid_ok = false;
+            }
+            // When tid_ok is false the range is empty, the keyed block is skipped, and
+            // control falls through to the FAST_SYSCALL_RET fallback with hypervisor_event
+            // still valid (the release() reclaim below is only reached on a non-empty range).
+            auto callbacks = tid_ok ? suspended_events_.map_.equal_range(thread_id)
+                                    : std::make_pair(suspended_events_.map_.end(),
+                                                     suspended_events_.map_.end());
             if (callbacks.first != callbacks.second) {
                 auto event = get_guest_event(std::move(hypervisor_event));
                 WakeAction action;
@@ -236,6 +265,90 @@ DomainImpl::filter_event(std::unique_ptr<HypervisorEvent>&& hypervisor_event) {
     }
 
     if (hypervisor_event->type() == EventType::EVENT_FAST_SYSCALL_RET) {
+        // SECTEPE: a FAST_SYSCALL_RET that NO thread_id-keyed suspended injector
+        // claimed above. A heavy injected syscall (e.g. NtCreateUserProcess) can make
+        // the guest reschedule, so at the return the vcpu's current thread
+        // (KPCR.current_thread, used for the keying above) is a DIFFERENT KTHREAD than
+        // the injected one -- equal_range(thread_id) misses and the return would be
+        // DROPPED here, stranding the suspended injector (its suspend() cv never wakes
+        // -> chain stalls -> "miss"). Before dropping, offer it to ALL suspended
+        // injectors; each one's wake lambda matches by its own captured return RIP/RSP
+        // (the RET fires in the injected thread's context, so its rip == the
+        // injection's return address even when the KPCR keying is stale) and PASSes if
+        // not theirs. PURE FALLBACK: only runs for an otherwise-dropped
+        // FAST_SYSCALL_RET, so the normal tid-matched path (Win10/Linux) is unchanged.
+        {
+            std::unique_lock lock(suspended_events_.mtx_);
+            if (!suspended_events_.map_.empty()) {
+                // SECTEPE head#4 (the REAL strand fix, part 2): two-phase fan-out.
+                //
+                // PHASE 1 -- INJECTOR waiters only: offer a REGISTER-ONLY NoOsEvent. The
+                // injector wake lambdas (syscall/function/page_fault) read ONLY vcpu
+                // registers (rip/rsp) and event.type(), never task/pcr/CurrentThread, so a
+                // task-less NoOsEvent is sufficient AND avoids the eager KPCR read that
+                // throws when the post-reschedule KPCR page is non-present (the original
+                // strand cause -- get_guest_event below would throw and the RET would
+                // self-complete on unwind). NoOsEvent's ctor materializes no task, so it
+                // cannot throw here. DROP is treated as PASS in this fan-out: only
+                // function.hh/page_fault.hh return DROP for a FAST_SYSCALL_RET (their
+                // lambda's default arm; they do not own it -- their EVENT_EXCEPTION guard
+                // is false for a RET), and the syscall injector that DOES own a RET returns
+                // only ACCEPT/PASS. So DROP must not swallow the RET before the owning
+                // injector is visited. hook_return waiters (plain suspend(), flag false)
+                // are SKIPPED here -- they legitimately deref the return event as a
+                // WindowsEvent (process_event), so a NoOsEvent must never reach them.
+                auto event = std::unique_ptr<Event>(
+                    std::make_unique<NoOsEvent>(std::move(hypervisor_event)));
+                bool consumed = false;
+                for (auto iter = suspended_events_.map_.begin();
+                     iter != suspended_events_.map_.end(); ++iter) {
+                    if (!iter->second->impl().is_injection_suspend())
+                        continue; // hook_return waiter -> Phase 2 only
+                    const WakeAction action = iter->second->impl().wake(std::move(event));
+                    if (action == WakeAction::ACCEPT) {
+                        suspended_events_.map_.erase(iter);
+                        consumed = true;
+                        break;
+                    }
+                    // DROP -> PASS: wake() only moves `event` out on ACCEPT, so on PASS/DROP
+                    // it is still valid -- keep iterating to the owning injector.
+                }
+                if (consumed)
+                    return nullptr;
+
+                // No injector matched. Reclaim the hypervisor_event from the un-consumed
+                // NoOsEvent (release() moves it back out; the spent NoOsEvent then holds a
+                // null hypervisor_event_ and is destroyed harmlessly).
+                hypervisor_event = event->impl().release();
+
+                // PHASE 2 -- hook_return waiters: build the EAGER (task-bearing)
+                // WindowsEvent and offer it. hook_return waiters legitimately deref the
+                // return event as a WindowsEvent (process_event -> task()/syscall()), so
+                // they must receive the eager event, never the NoOsEvent. If the eager
+                // build throws (non-present KPCR / bad type index), the catch drops the
+                // event == today's no-regression worst case (identical to the poller-skip).
+                try {
+                    auto eager = get_guest_event(std::move(hypervisor_event));
+                    for (auto iter = suspended_events_.map_.begin();
+                         iter != suspended_events_.map_.end(); ++iter) {
+                        if (iter->second->impl().is_injection_suspend())
+                            continue; // already offered in Phase 1
+                        const WakeAction action = iter->second->impl().wake(std::move(eager));
+                        if (action == WakeAction::ACCEPT) {
+                            suspended_events_.map_.erase(iter);
+                            return nullptr;
+                        }
+                        if (action == WakeAction::DROP)
+                            return nullptr;
+                        // PASS: eager not moved; try the next hook_return waiter.
+                    }
+                } catch (const MemoryException&) {
+                    return nullptr; // non-present KPCR during eager build -> drop (== today)
+                } catch (const windows::IncorrectTypeException&) {
+                    return nullptr; // bad type index during eager build -> drop (== today)
+                }
+            }
+        }
         // This would've been handled by a suspended thread above
         return nullptr;
     }
@@ -305,6 +418,10 @@ bool DomainImpl::detect_guest() {
 
     LOG4CXX_DEBUG(logger, "Attempting OS detection...");
 
+    // SECTEPE: clear any prior KPTI kernel-CR3 hint; repopulated below from the
+    // first CR3-WRITE event whose written value maps the kernel.
+    detect_cr3_hint_ = 0;
+
     pause();
 
     // Save the previous state
@@ -316,7 +433,13 @@ bool DomainImpl::detect_guest() {
         vcpu(i).intercept_system_calls(false);
         vcpu(i).intercept_cr_writes(3, false);
     }
-    vcpu(0).intercept_cr_writes(3, true);
+    // SECTEPE (KPTI): intercept CR3 writes on EVERY vcpu (not just vcpu0). Under
+    // KPTI the guest loads the kernel CR3 on every syscall/interrupt entry
+    // (SWITCH_TO_KERNEL_CR3); intercepting all vcpus maximises the chance of
+    // catching such a write during the busy boot window when no vcpu is observed
+    // already in kernel mode.
+    for (uint32_t i = 0; i < vcpu_count(); ++i)
+        vcpu(i).intercept_cr_writes(3, true);
 
     resume();
 
@@ -343,6 +466,18 @@ bool DomainImpl::detect_guest() {
                         auto event = reinterpret_cast<VcpuImpl&>(v).event();
                         if (!event)
                             continue;
+
+                        // SECTEPE (KPTI): if this woke us on a CR3 write, the value
+                        // being loaded maps the kernel whenever the guest just ran
+                        // SWITCH_TO_KERNEL_CR3 (syscall/interrupt entry). Capture it
+                        // so NtKernelImpl can scan the kernel base through a
+                        // kernel-mapping CR3 even when every vcpu is in user mode.
+                        // registers().cr3() here is still the OLD (user) value -- the
+                        // CR-write VM-exit fires before the write commits.
+                        if (event->type() == EventType::EVENT_CR_WRITE &&
+                            event->control_register() == 3) {
+                            detect_cr3_hint_ = event->control_register_value();
+                        }
 
                         const bool is64bit = v.registers().efer().lme();
                         page_directory_.reconfigure(v);
@@ -377,6 +512,17 @@ bool DomainImpl::detect_guest() {
                                 LOG4CXX_DEBUG(logger, "Failed to detect LinuxGuest: " << ex);
                             }
                         }
+
+                        // SECTEPE (KPTI): both guest constructions failed for THIS
+                        // event. Complete it so the vcpu RESUMES and runs on to its
+                        // next CR3 write -- otherwise it stays halted in-event and the
+                        // remaining poll retries see no new events (they only ever
+                        // sampled this one CR3 write, so a user-CR3 first event failed
+                        // the whole window). Completing lets detection walk through
+                        // successive CR3 writes until a SWITCH_TO_KERNEL_CR3 supplies a
+                        // kernel-mapping CR3 (captured into detect_cr3_hint_) even when
+                        // every vcpu is in user mode for the entire detection window.
+                        v.complete_event();
                     }
                 }
             }
@@ -398,6 +544,15 @@ done:
 
 Guest* DomainImpl::guest() { return guest_.get(); }
 const Guest* DomainImpl::guest() const { return guest_.get(); }
+
+GuestImpl* DomainImpl::page_fault_guest() const {
+    // During detect_guest() the under-construction WindowsGuestImpl registers itself
+    // here (guest_ is not assigned until construction succeeds); prefer it so
+    // PageDirectory::translate can resolve transition/standby PTEs during detection.
+    if (detection_pf_guest_)
+        return detection_pf_guest_;
+    return guest_ ? &guest_->impl() : nullptr;
+}
 
 void DomainImpl::intercept_system_calls(bool enabled) {
     for (unsigned int i = 0; i < vcpu_count(); ++i) {
@@ -468,6 +623,21 @@ restart:
         case EventType::EVENT_MEM_ACCESS:
             handle_breakpoint(*event);
             goto done;
+        case EventType::EVENT_SINGLE_STEP:
+            /*
+             * SECTEPE (W4.1 step trace): a Monitor Trap Flag exit while a
+             * Domain::single_step() handle is live belongs to its callback. Until
+             * now only the step a breakpoint takes over its own int3 reached the
+             * SingleStepManager (via handle_breakpoint), so a SingleStep callback
+             * fired once and the trap flag then fed bare EVENT_SINGLE_STEP events
+             * to the tool. A step on a vcpu nobody steps still goes to the tool,
+             * as before.
+             */
+            if (single_step_manager_.stepping(event->vcpu())) {
+                single_step_manager_.handle_event(*event);
+                goto done;
+            }
+            break;
         default:
             break;
         }
@@ -959,6 +1129,8 @@ void DomainImpl::suspend_event_step(Event& event) {
 }
 
 const x86::PageDirectory& DomainImpl::page_directory() const { return page_directory_; }
+
+const PageTableWalker& DomainImpl::page_table_walker() const { return page_directory_; }
 
 DomainImpl::DomainImpl()
     : watchpoint_manager_(), breakpoint_manager_(), page_directory_(*this),

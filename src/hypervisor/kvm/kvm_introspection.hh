@@ -60,6 +60,39 @@ struct kvm_cr_monitor {
     int mode; // Bitmask of KVM_MONITOR_CR_[READ/WRITE]
 };
 
+/*
+ * SECTEPE CEILING (Win11 injection determinism): per-vcpu SYSCALL-hook emission
+ * filter. When a FAST_SYSCALL injection turns the global per-vcpu hook ON
+ * (KVM_SET_SYSCALL_HOOK), EVERY syscall return on that vcpu becomes a
+ * FAST_SYSCALL_RET event -- the ~6500-event/launch "flood" that drives the
+ * head-#4 wake-match race. This filter lets the kernel SUPPRESS emission for any
+ * thread/address-space that is NOT the injecting one, so the injected syscall's
+ * return becomes the deterministic next event for the vcpu.
+ *
+ * ADDITIVE + FEATURE-DETECTED: this is a brand new sibling ioctl (0xe0). The
+ * kvm_introspection_event struct layout is UNCHANGED, so KVM_INTROSPECTION_API_VERSION
+ * is intentionally NOT bumped (KvmHypervisor.cc:154 hard-rejects a version
+ * mismatch -- bumping would break attach to an older patched .ko). An unpatched
+ * kernel returns ENOTTY/EINVAL for 0xe0; the library latches filter unsupported
+ * and falls back to the existing global flood path. SHIP MODE = THREAD_OR_CR3
+ * ONLY, with a mandatory deadline auto-revert, so a mis-keyed filter degrades to
+ * today's flood (recoverable) and never fail-closes into a hang.
+ */
+#define KVM_SYSCALL_FILTER_NONE 0          // legacy: emit all syscalls on this vcpu
+#define KVM_SYSCALL_FILTER_THREAD_ID 1     // emit only when current kstack base == thread_id
+#define KVM_SYSCALL_FILTER_CR3 2           // emit only when guest CR3(PML4 phys) == cr3
+#define KVM_SYSCALL_FILTER_THREAD_OR_CR3 3 // emit when EITHER matches  <-- ship this only
+
+struct kvm_syscall_hook_filter {
+    __u32 mode;        // KVM_SYSCALL_FILTER_*
+    __u32 flags;       // reserved, MUST be 0
+    __u64 thread_id;   // kernel stack base; MUST equal the value the kernel emits in
+                       // system_call_ret.thread_id (NOT KTHREAD.StackBase -- see C1)
+    __u64 cr3;         // guest CR3; kernel masks low 12 (PCID) + bit63
+    __u64 deadline_ns; // monotonic deadline: kernel auto-reverts mode->NONE and resumes
+                       // emit-all past this; 0 = no auto-revert (discouraged)
+};
+
 struct kvm_introspection_event {
     __u64 event_id; // Increments with each event
     int event_type; // KVM_EVENT_TYPE_
@@ -157,6 +190,9 @@ struct kvm_introspection_event {
 #define KVM_INJECT_TRAP _IOW(KVMIO, 0xdd, struct kvm_inject_trap)
 #define KVM_SET_MONITOR_TRAP_FLAG _IOW(KVMIO, 0xde, unsigned long)
 #define KVM_SET_INVLPG_HOOK _IOW(KVMIO, 0xdf, unsigned long)
+// SECTEPE CEILING: per-vcpu syscall emission filter (additive; feature-detected via
+// ENOTTY/EINVAL on an unpatched kernel). See struct kvm_syscall_hook_filter above.
+#define KVM_SET_SYSCALL_HOOK_FILTER _IOW(KVMIO, 0xe0, struct kvm_syscall_hook_filter)
 #define KVM_VCPU_INJECT_SYSCALL _IO(KVMIO, 0xf1)
 #define KVM_VCPU_INJECT_SYSENTER _IO(KVMIO, 0xf2)
 

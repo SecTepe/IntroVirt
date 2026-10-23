@@ -71,6 +71,8 @@ class NtKernelImpl final : public NtKernel, public TypeContainer {
 
     const guest_ptr<void>& ptr() const override;
 
+    uint64_t page_directory() const override;
+
     uint64_t InvalidPteMask() const override;
 
     const TypeTable& types() const override;
@@ -117,6 +119,7 @@ class NtKernelImpl final : public NtKernel, public TypeContainer {
     std::optional<TypeTableImpl<PtrType>> type_table_;
 
     guest_ptr<void> ptr_;
+    uint64_t kernel_cr3_ = 0;
     guest_ptr<void> global_directory_address_;
 
     std::optional<pe::PE_IMPL> pe_;

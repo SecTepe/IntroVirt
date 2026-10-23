@@ -111,7 +111,7 @@ int main(int argc, char** argv) {
                   << vcpu.registers().gdtr_limit() << std::dec << '\n';
 
         print_header();
-        auto gdt = vcpu.global_descriptor_table();
+        auto gdt = vcpu.x86()->global_descriptor_table();
         dump_table(gdt, false);
         std::cout << '\n';
 
@@ -119,7 +119,7 @@ int main(int argc, char** argv) {
         dump_segment(vcpu.registers().ldt(), false);
         if (vcpu.registers().ldt().base()) {
             print_header();
-            auto ldt = vcpu.global_descriptor_table();
+            auto ldt = vcpu.x86()->global_descriptor_table();
             dump_table(ldt, true);
             std::cout << '\n';
         }

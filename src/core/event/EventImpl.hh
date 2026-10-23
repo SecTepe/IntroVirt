@@ -47,6 +47,22 @@ class EventImpl {
     virtual std::unique_ptr<Event> suspend(std::function<WakeAction(Event&)> check_wakeup) = 0;
 
     /**
+     * @brief Suspend like suspend(), but tag this suspension as an INJECTOR waiter.
+     *
+     * SECTEPE head#4: only injector waiters may be offered the register-only NoOsEvent
+     * fallback for an otherwise-dropped FAST_SYSCALL_RET (their wake lambdas read only
+     * vcpu registers/type). hook_return waiters use plain suspend() (flag stays false)
+     * and only ever receive the eager task-bearing WindowsEvent (filter_event Phase 2).
+     */
+    virtual std::unique_ptr<Event>
+    suspend_injection(std::function<WakeAction(Event&)> check_wakeup) = 0;
+
+    /**
+     * @brief True while this event is suspended as an injector waiter.
+     */
+    virtual bool is_injection_suspend() const = 0;
+
+    /**
      * @brief Wake the event back up
      */
     virtual WakeAction wake(std::unique_ptr<Event>&& event) = 0;
@@ -190,29 +206,67 @@ class EventImplTpl : public _BaseClass, public EventImpl {
      * @brief Suspend the event until another event comes in for the same thread
      */
     std::unique_ptr<Event> suspend(std::function<WakeAction(Event&)> check_wakeup) override {
+        return suspend_impl(std::move(check_wakeup), /*injection=*/false);
+    }
+
+    /**
+     * @brief Suspend as an injector waiter (eligible for the NoOsEvent fallback)
+     */
+    std::unique_ptr<Event>
+    suspend_injection(std::function<WakeAction(Event&)> check_wakeup) override {
+        return suspend_impl(std::move(check_wakeup), /*injection=*/true);
+    }
+
+    bool is_injection_suspend() const override { return injection_suspend_; }
+
+    // SECTEPE head#4: kept in the public run on purpose -- introducing a mid-class
+    // private:/public: bracket here would risk silently making wake()/step()/etc.
+    // (declared below) private and break DomainImpl::filter_event's wake() calls.
+    std::unique_ptr<Event> suspend_impl(std::function<WakeAction(Event&)> check_wakeup,
+                                        bool injection) {
         introvirt_assert(check_wakeup != nullptr, "");
-
-        std::unique_lock lock(mtx_);
-        hypervisor_event_->domain().suspend_event(*this);
-
-        if (unlikely(interrupted_)) {
-            throw InterruptedException();
-        }
 
         auto& vcpu = static_cast<VcpuImpl&>(this->vcpu());
 
-        woke_ = false;
-        check_wakeup_ = check_wakeup;
+        // SECTEPE: arm the wakeup predicate under mtx_, but do NOT hold mtx_ while
+        // taking the suspended-events map lock (suspend_event). filter_event() holds
+        // that map lock while calling wake(), and wake() now also takes mtx_; holding
+        // mtx_ across the map lock here would invert that order and deadlock. Ordering:
+        // arm (mtx_) -> register in map (map lock, no mtx_) -> complete + wait (mtx_).
+        // The injected call has not run yet at register time (complete_event below
+        // resumes the vcpu), so no wake() can fire for us before we wait.
+        //
+        // SECTEPE head#4: injection_suspend_ is published here UNDER mtx_, before the
+        // suspend_event() map insert. The fan-out in filter_event reads it only after
+        // acquiring the suspended-events map lock that this thread releases inside
+        // suspend_event() -- a happens-before edge -- so the unlocked read there is safe
+        // (same publication discipline as check_wakeup_). Set once per suspension and
+        // cleared on every exit path so a stale tag never survives into a later plain
+        // suspend().
+        {
+            std::unique_lock lock(mtx_);
+            if (unlikely(interrupted_)) {
+                throw InterruptedException();
+            }
+            woke_ = false;
+            injection_suspend_ = injection;
+            check_wakeup_ = check_wakeup;
+        }
 
+        hypervisor_event_->domain().suspend_event(*this);
+
+        std::unique_lock lock(mtx_);
         // Let the VCPU know that it's no longer in an event
         vcpu.complete_event();
         cv_.wait(lock, [this] { return woke_ || interrupted_; });
 
         if (unlikely(interrupted_)) {
+            injection_suspend_ = false;
             discard(true);
             throw InterruptedException();
         }
 
+        injection_suspend_ = false;
         return std::move(step_event_);
     }
 
@@ -220,20 +274,26 @@ class EventImplTpl : public _BaseClass, public EventImpl {
      * @brief Wake the event back up
      */
     WakeAction wake(std::unique_ptr<Event>&& event) override {
-        introvirt_assert(check_wakeup_ != nullptr, "");
-
-        // SECTEPE: guard an unarmed wake. `introvirt_assert` is a no-op in
-        // release builds, so when wake() runs with no `check_wakeup_` armed —
-        // a second event for the same thread arrives before the suspended
-        // entry event re-arms, or a duplicate/spurious wake — invoking the
-        // empty std::function below threw std::bad_function_call and aborted
-        // the whole session mid-trace. The Linux entry→return syscall
-        // correlation (every syscall sets will_return()) hits this on a busy
-        // guest. Treat "not armed" as PASS: let the event flow normally.
-        if (!check_wakeup_)
+        // SECTEPE: read check_wakeup_ under mtx_ (COPY it) instead of touching the
+        // shared std::function unlocked. The previous unlocked read+call raced with
+        // suspend()'s assignment of check_wakeup_: under the heavy per-launch
+        // FAST_SYSCALL_RET flood (~6500 wake() calls/launch on a busy boot), a foreign
+        // return's wake() could observe a torn/stale std::function while a worker armed
+        // the next injection -> our injection's real return PASSed and was dropped ->
+        // the injector stranded (the create-but-not-resumed Heisenbug; instrumentation
+        // shifted the timing and masked it). suspend() no longer holds mtx_ while taking
+        // the suspended-events map lock, so locking here cannot invert against
+        // filter_event's (map lock -> wake()) path. An unarmed predicate (a second
+        // event arriving before re-arm, or a duplicate wake) is still treated as PASS.
+        std::function<WakeAction(Event&)> cb;
+        {
+            std::unique_lock lock(mtx_);
+            cb = check_wakeup_;
+        }
+        if (!cb)
             return WakeAction::PASS;
 
-        WakeAction result = check_wakeup_(*event);
+        WakeAction result = cb(*event);
         if (result == WakeAction::ACCEPT) {
             std::unique_lock lock(mtx_);
             check_wakeup_ = std::function<WakeAction(Event&)>();
@@ -343,6 +403,7 @@ class EventImplTpl : public _BaseClass, public EventImpl {
     std::function<WakeAction(Event&)> check_wakeup_;
     std::unique_ptr<Event> step_event_;
     bool injection_performed_ = false;
+    bool injection_suspend_ = false;
     bool woke_ = false;
     bool interrupted_ = false;
 };
